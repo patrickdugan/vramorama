@@ -13,6 +13,8 @@ pub struct Holder {
     pub last: f64,
     pub peak_mib: f64,
     pub gib_hours: f64,
+    /// The part of `gib_hours` held while the process's busiest engine was under 1%.
+    pub idle_gib_hours: f64,
     pub max_util: f64,
     pub pids: BTreeSet<u64>,
     pub example_cmd: Option<String>,
@@ -72,6 +74,10 @@ pub fn summarise(log: &str) -> Report {
                 h.last = ts[i];
                 h.peak_mib = h.peak_mib.max(mib);
                 h.gib_hours += mib / 1024.0 * dt / 3600.0;
+                // A missing reading (null) is unknown, not idle.
+                if p.f64("util").is_some_and(|u| u < crate::idle::IDLE_UTIL) {
+                    h.idle_gib_hours += mib / 1024.0 * dt / 3600.0;
+                }
                 h.max_util = h.max_util.max(p.f64("util").unwrap_or(0.0));
                 if let Some(pid) = p.f64("pid") {
                     h.pids.insert(pid as u64);
@@ -111,15 +117,16 @@ pub fn render(r: &Report, width: usize) -> String {
         if r.bad_lines > 0 { format!(" ({} unreadable lines skipped)", r.bad_lines) } else { String::new() }
     ));
     out.push_str(&format!(
-        "{:<34} {:>8} {:>9} {:>5} {:>7}  {}\n",
-        "OWNER", "GiB·h", "PEAK MiB", "GPU%", "HELD", "WHAT"
+        "{:<34} {:>8} {:>8} {:>9} {:>5} {:>7}  {}\n",
+        "OWNER", "GiB·h", "IDLE", "PEAK MiB", "GPU%", "HELD", "WHAT"
     ));
     for h in &r.holders {
         let what = h.title.clone().or_else(|| h.example_cmd.clone()).unwrap_or_default();
         let line = format!(
-            "{:<34} {:>8.2} {:>9} {:>5.0} {:>7}  {}",
+            "{:<34} {:>8.2} {:>8.2} {:>9} {:>5.0} {:>7}  {}",
             ellipsize(&h.key, 34),
             h.gib_hours,
+            h.idle_gib_hours,
             thousands(h.peak_mib as u64),
             h.max_util,
             hms(h.last - h.first),
@@ -140,6 +147,7 @@ pub fn to_json(r: &Report) -> Value {
                 ("owner", h.key.as_str().into()),
                 ("title", h.title.clone().into()),
                 ("gib_hours", ((h.gib_hours * 1000.0).round() / 1000.0).into()),
+                ("idle_gib_hours", ((h.idle_gib_hours * 1000.0).round() / 1000.0).into()),
                 ("peak_mib", h.peak_mib.into()),
                 ("max_util", h.max_util.into()),
                 ("first_ts", h.first.into()),
@@ -189,6 +197,9 @@ mod tests {
         let l = r.holders.iter().find(|h| h.key == "untagged llama-server.exe pid 500").unwrap();
         // 60 + 60 + min(36000, 180) + 60 (last sample uses the typical interval) seconds at 1 GiB.
         assert!((l.gib_hours - 360.0 / 3600.0).abs() < 1e-9, "{}", l.gib_hours);
+        // The server sat at 0% throughout; the queue job was busy.
+        assert!((l.idle_gib_hours - l.gib_hours).abs() < 1e-9);
+        assert_eq!(q.idle_gib_hours, 0.0);
         assert_eq!(l.last - l.first, 36120.0);
         assert!(render(&r, 200).contains("claude:5f3c1e2a"));
     }

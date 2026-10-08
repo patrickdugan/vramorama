@@ -50,12 +50,14 @@ is required: no SDK headers, no import libraries beyond what Rust itself links.
 | Command | What it does |
 |---|---|
 | `vramorama` / `vramorama ps` | Processes holding GPU memory now, with owner, start time, working folder and command. `--json`, `--all` (include integrated GPUs), `--min MIB` (default 16), `--wide`, `--trace` (trace every untagged process). |
-| `vramorama watch` | Refreshes every `--interval` seconds (default 5) and keeps a **running watermark**: each process's peak, and each owner's current and peak total. `--log FILE` appends one JSON line per sample; `--quiet` only logs. |
-| `vramorama report FILE` | Summarises a watch log: GiB-hours, peak, GPU% and time held per owner. Answers "what sat on the card all night?" Gaps (sleep, a stopped watcher) are capped so they do not count as use. `--json`. |
+| `vramorama watch` | Refreshes every `--interval` seconds (default 5) and keeps a **running watermark**: each process's peak and how long it has been idle, and each owner's current and peak total. `--log FILE` appends one JSON line per sample; `--quiet` only logs. |
+| `vramorama report FILE` | Summarises a watch log: GiB-hours (and how many of them were *idle*, held at under 1% GPU), peak, GPU% and time held per owner. Answers "what sat on the card all night?" Gaps (sleep, a stopped watcher) are capped so they do not count as use. `--json`. |
 | `vramorama trace PID` | For an untagged process: its full launch chain, and the agent transcript that typed the command. |
 | `vramorama run --vram 9G -- CMD…` | Waits for a VRAM lease (first come, first served), then runs `CMD` tagged with it. `--detach [--out LOG]` starts it outside the session. See [Sharing the card](#sharing-the-card-vramorama-run). |
 | `vramorama leases` | The lease ledger and how much a new request could get right now. `--json`. |
 | `vramorama hook` | A Claude Code `PreToolUse` hook that stops WMI / Task Scheduler launches that would strip a job's tags. See [The agent hook](#the-agent-hook). |
+| `vramorama idle` | Processes that held memory but did no GPU work for `--window` seconds (default 20), each judged *stale* or *idle*. See [Idle holders](#idle-holders). |
+| `vramorama reclaim [PID…]` | Re-checks idle holders (all stale ones if no PID is given) and prints the command that would free them. It never stops anything itself. |
 
 Leave a watcher running overnight:
 
@@ -169,6 +171,24 @@ A line for your agent instructions (`CLAUDE.md`, `AGENTS.md`):
 > jobs that must outlive the session) instead of polling for free memory yourself. Run `vramorama`
 > to see what is on the card and who started it.
 
+## Idle holders
+
+A process is *idle* when its busiest GPU engine stays under 1% for the whole window. `idle` then
+judges each one:
+
+- **stale**: it carries an agent session tag, and that session has ended (the Claude Code
+  process named by `CLAUDE_PID` is gone). This is the only verdict that needs positive evidence.
+- **idle**: everything else. Something may still want it: a live session, a `VRAMORAMA_OWNER`
+  label, a lease, or no tag at all. Untagged processes are never called stale. Their launch chain
+  being cut proves nothing: every browser GPU helper started by a short-lived launcher looks
+  exactly like that. Run `trace` on them instead.
+
+`reclaim` repeats the checks for the PIDs you name, or for every stale holder of at least 256 MiB,
+and refuses busy, system and possibly-wanted processes (`--force` includes the last group with a
+warning). For the rest it prints a `Stop-Process -Id …` line with each process's start time, so you
+can confirm the pid has not been reused. vramorama does not stop processes itself; that decision
+stays with whoever runs the command.
+
 ## How it works
 
 - **Memory and utilisation:** the `GPU Process Memory(*)\Dedicated Usage`, `GPU Engine(*)\Utilization
@@ -194,8 +214,10 @@ workflow uses no third-party actions (it checks out with plain `git`).
 
 - Windows 10/11 only, except `report` and `hook`, which run anywhere. A Linux backend (NVML) is
   planned.
-- `run` schedules only the jobs started through it; it never stops or kills anything. Other GPU
-  users are respected (their memory counts as in use) but not queued.
+- `run` schedules only the jobs started through it, and nothing in vramorama stops or kills a
+  process. Other GPU users are respected (their memory counts as in use) but not queued.
+- A server that waits idle between requests (an inference server between evaluation batches) is
+  *idle* by these rules. The verdict only says nobody appears to own it, not that nobody uses it.
 - A job that allocates more than its lease asked for is not stopped; the excess simply counts as in
   use for everyone else.
 - Processes running elevated or as another user need an elevated vramorama to read their
@@ -208,8 +230,8 @@ workflow uses no third-party actions (it checks out with plain `git`).
 
 ## Roadmap
 
-1. A policy for idle holders (for example a `llama-server` at 0% whose session ended), opt-in.
-2. A WSL client on the same ledger, so jobs inside WSL queue with Windows ones.
+1. A WSL client on the same ledger, so jobs inside WSL queue with Windows ones.
+2. Server awareness for `idle`: open client connections on a listening port count as use.
 3. An MCP server for agents, and the Linux/NVML backend.
 
 ## License

@@ -1,6 +1,6 @@
 [package]
 name = "vramorama"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Who is holding my GPU? Per-process VRAM with the agent session that launched it, for a single workstation."

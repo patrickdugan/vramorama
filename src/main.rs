@@ -4,6 +4,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 mod hook;
+mod idle;
 mod json;
 mod ledger;
 mod owner;
@@ -47,11 +48,17 @@ USAGE
   vramorama hook
       Claude Code PreToolUse hook: blocks WMI / Task Scheduler launches that would
       strip a job's session tags (exit code 2 with the reason on stderr).
+  vramorama idle [--window SECS] [--min MIB] [--json]
+      Processes that held memory but did no GPU work for SECS (default 20). Stale means
+      the agent session that started it has ended; untagged processes are never stale.
+  vramorama reclaim [PID...] [--force] [--window SECS]
+      Re-check idle holders (all stale ones if no PID is given) and print the command
+      that would free their memory. vramorama never stops a process itself.
 
 OPTIONS
   --json        machine-readable output
   --all         include integrated and software adapters
-  --min MIB     hide processes holding less than MIB (default 16)
+  --min MIB     hide processes holding less than MIB (default 16; 256 for idle)
   --wide        do not truncate to the console width
   --trace       run `trace` for every untagged process
   --headroom    MiB left free for the desktop and drivers when admitting (default 512)
@@ -78,6 +85,9 @@ pub struct Opts {
     pub quiet: bool,
     pub headroom_mib: u64,
     pub adapter: Option<String>,
+    pub window: Option<f64>,
+    pub force: bool,
+    pub min_given: bool,
     pub positional: Vec<String>,
 }
 
@@ -92,7 +102,18 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--wide" => o.wide = true,
             "--trace" => o.trace = true,
             "--quiet" | "-q" => o.quiet = true,
-            "--min" => o.min_mib = value("--min")?.parse().map_err(|_| "--min takes a whole number of MiB")?,
+            "--min" => {
+                o.min_mib = value("--min")?.parse().map_err(|_| "--min takes a whole number of MiB")?;
+                o.min_given = true;
+            }
+            "--force" => o.force = true,
+            "--window" => {
+                let w: f64 = value("--window")?.parse().map_err(|_| "--window takes seconds")?;
+                if !(2.0..=3600.0).contains(&w) {
+                    return Err("--window must be between 2 and 3600 seconds".into());
+                }
+                o.window = Some(w);
+            }
             "--interval" | "-n" => {
                 o.interval = value("--interval")?.parse().map_err(|_| "--interval takes seconds")?;
                 if !(0.5..=86_400.0).contains(&o.interval) {
@@ -150,7 +171,8 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         "run" => os_run(rest),
-        "ps" | "watch" | "trace" | "leases" => os_command(cmd, parse_opts(rest)?).map(|()| 0),
+        "ps" | "watch" | "trace" | "leases" | "idle" => os_command(cmd, parse_opts(rest)?).map(|()| 0),
+        "reclaim" => os_reclaim(parse_opts(rest)?),
         other => Err(format!("unknown command {other}; see --help")),
     }
 }
@@ -161,6 +183,11 @@ fn os_command(cmd: &str, o: Opts) -> Result<(), String> {
         "ps" => app::ps(&o),
         "watch" => app::watch(&o),
         "leases" => run::leases(o.json, o.adapter.as_deref(), o.headroom_mib),
+        "idle" => {
+            let o = Opts { min_mib: if o.min_given { o.min_mib } else { 256 }, ..o };
+            let window = o.window.unwrap_or(20.0);
+            app::idle(&o, window)
+        }
         _ => {
             let [pid] = o.positional.as_slice() else { return Err("usage: vramorama trace PID".into()) };
             app::trace(pid.parse().map_err(|_| format!("not a pid: {pid}"))?)
@@ -216,6 +243,21 @@ fn os_run(args: &[String]) -> Result<i32, String> {
         return Err("--out only applies with --detach".into());
     }
     run::run(&o)
+}
+
+#[cfg(windows)]
+fn os_reclaim(o: Opts) -> Result<i32, String> {
+    let pids = o
+        .positional
+        .iter()
+        .map(|p| p.parse::<u32>().map_err(|_| format!("not a pid: {p}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    app::reclaim(&pids, o.force, o.window.unwrap_or(10.0))
+}
+
+#[cfg(not(windows))]
+fn os_reclaim(_o: Opts) -> Result<i32, String> {
+    Err("`reclaim` needs Windows in this version.".into())
 }
 
 #[cfg(not(windows))]

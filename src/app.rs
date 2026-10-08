@@ -1,4 +1,4 @@
-//! The Windows commands: ps, watch, trace.
+//! The Windows commands: ps, watch, trace, idle, reclaim.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::Opts;
 use crate::gpu::{self, Adapter, Sample, Sampler};
+use crate::idle::{IDLE_UTIL, Verdict, classify};
 use crate::json::{Value, obj};
 use crate::owner::{Owner, short};
 use crate::parse::{args_tail, basename, duration, ellipsize, needles, thousands};
@@ -59,6 +60,7 @@ pub fn watch(o: &Opts) -> Result<(), String> {
         }
         None => None,
     };
+    let mut idle_since: HashMap<(u32, u64), u64> = HashMap::new();
     let since = now_filetime();
     loop {
         std::thread::sleep(Duration::from_secs_f64(o.interval));
@@ -69,8 +71,14 @@ pub fn watch(o: &Opts) -> Result<(), String> {
         let rows = scanner.rows(&sample, &table, &luids, o.min_mib);
         let now = now_filetime();
         for r in &rows {
-            let p = peaks.entry((r.pid, r.luid)).or_insert(0);
+            let key = (r.pid, r.luid);
+            let p = peaks.entry(key).or_insert(0);
             *p = (*p).max(r.mib);
+            if r.util.is_some_and(|u| u < IDLE_UTIL) {
+                idle_since.entry(key).or_insert(now);
+            } else {
+                idle_since.remove(&key);
+            }
         }
         update_marks(&mut marks, &rows, now);
         if let Some(f) = log.as_mut() {
@@ -88,7 +96,8 @@ pub fn watch(o: &Opts) -> Result<(), String> {
                 fmt_short(since),
                 o.log.as_deref().map(|p| format!(", logging to {p}")).unwrap_or_default()
             ));
-            screen.push_str(&render(&adapters, &sample, &rows, Some(&peaks), width));
+            let view = WatchView { peaks: &peaks, idle_since: &idle_since, now };
+            screen.push_str(&render(&adapters, &sample, &rows, Some(&view), width));
             screen.push_str(&render_marks(&marks, width));
             print!("{screen}");
             std::io::stdout().flush().ok();
@@ -207,13 +216,14 @@ fn command_text(r: &Row) -> String {
     s
 }
 
-pub fn render(
-    adapters: &[Adapter],
-    sample: &Sample,
-    rows: &[Row],
-    peaks: Option<&HashMap<(u32, u64), u64>>,
-    width: usize,
-) -> String {
+/// What `watch` adds to the table: each process's peak, and since when it has been idle.
+pub struct WatchView<'a> {
+    peaks: &'a HashMap<(u32, u64), u64>,
+    idle_since: &'a HashMap<(u32, u64), u64>,
+    now: u64,
+}
+
+pub fn render(adapters: &[Adapter], sample: &Sample, rows: &[Row], watch: Option<&WatchView>, width: usize) -> String {
     const OWNER_W: usize = 44;
     let mut out = String::new();
     for a in adapters {
@@ -233,14 +243,19 @@ pub fn render(
             out.push_str("  (no process holds memory above the --min threshold)\n\n");
             continue;
         }
-        let peak_h = if peaks.is_some() { format!(" {:>9}", "PEAK MiB") } else { String::new() };
+        let peak_h = if watch.is_some() { format!(" {:>9} {:>6}", "PEAK MiB", "IDLE") } else { String::new() };
         out.push_str(&format!(
             "{:>7} {:>9}{peak_h} {:>5}  {:<11}  {:<OWNER_W$}  {}\n",
             "PID", "VRAM MiB", "GPU%", "STARTED", "OWNER", "COMMAND"
         ));
         for r in mine {
-            let peak = match peaks {
-                Some(p) => format!(" {:>9}", thousands(p.get(&(r.pid, r.luid)).copied().unwrap_or(r.mib))),
+            let key = (r.pid, r.luid);
+            let peak = match watch {
+                Some(w) => format!(
+                    " {:>9} {:>6}",
+                    thousands(w.peaks.get(&key).copied().unwrap_or(r.mib)),
+                    w.idle_since.get(&key).map_or("–".into(), |&t| duration((w.now - t) as f64 / 1e7))
+                ),
                 None => String::new(),
             };
             let util = r.util.map_or("–".into(), |u| format!("{u:.0}"));
@@ -363,4 +378,176 @@ pub fn trace(pid: u32) -> Result<(), String> {
         println!("            via {} {via}: {}", table[&via].exe, h.needle);
     }
     Ok(())
+}
+
+/// Each process seen in the last sample of a window, with its busiest engine reading over the window.
+type Observed = Vec<(Row, f64)>;
+
+/// Watch the card for `window` seconds.
+fn observe_window(window: f64, all: bool, min_mib: u64) -> Result<(Vec<Adapter>, Observed), String> {
+    let mut sampler = Sampler::open()?;
+    sampler.prime();
+    let dxgi = gpu::adapters();
+    let mut scanner = Scanner::default();
+    let mut busiest: HashMap<(u32, u64), f64> = HashMap::new();
+    let (mut adapters, mut rows) = (Vec::new(), Vec::new());
+    for _ in 0..(window.max(2.0).ceil() as u32) {
+        std::thread::sleep(Duration::from_secs(1));
+        let sample = sampler.sample();
+        let table = procs::snapshot();
+        adapters = pick_adapters(dxgi.clone(), &sample, all);
+        let luids: Vec<u64> = adapters.iter().map(|a| a.luid).collect();
+        rows = scanner.rows(&sample, &table, &luids, min_mib);
+        for r in &rows {
+            let b = busiest.entry((r.pid, r.luid)).or_insert(0.0);
+            *b = b.max(r.util.unwrap_or(0.0));
+        }
+    }
+    let observed = rows
+        .into_iter()
+        .map(|r| {
+            let b = busiest[&(r.pid, r.luid)];
+            (r, b)
+        })
+        .collect();
+    Ok((adapters, observed))
+}
+
+/// Verdict for an idle row; processes vramorama cannot inspect are never judged stale.
+fn judge(r: &Row) -> (Verdict, String) {
+    if r.note.is_some() || is_host(&r.name) {
+        return (Verdict::Idle, "a system or protected process".into());
+    }
+    classify(&r.owner, r.harness_live, r.root.as_deref())
+}
+
+/// `vramorama idle`: processes that held memory but did no GPU work for the whole window.
+pub fn idle(o: &Opts, window: f64) -> Result<(), String> {
+    let (adapters, rows) = observe_window(window, o.all, o.min_mib)?;
+    let mut idle: Vec<(&Row, Verdict, String)> = rows
+        .iter()
+        .filter(|(_, busiest)| *busiest < IDLE_UTIL)
+        .map(|(r, _)| {
+            let (v, why) = judge(r);
+            (r, v, why)
+        })
+        .collect();
+    idle.sort_by(|a, b| (b.1 == Verdict::Stale).cmp(&(a.1 == Verdict::Stale)).then(b.0.mib.cmp(&a.0.mib)));
+    if o.json {
+        let list = idle
+            .iter()
+            .map(|(r, v, why)| {
+                let mut j = crate::scan::row_json(r);
+                if let Value::Obj(kv) = &mut j {
+                    kv.push(("verdict".into(), if *v == Verdict::Stale { "stale" } else { "idle" }.into()));
+                    kv.push(("why".into(), why.as_str().into()));
+                }
+                j
+            })
+            .collect();
+        println!("{}", obj([("window_secs", window.into()), ("idle", Value::Arr(list))]));
+        return Ok(());
+    }
+    let names: Vec<&str> = adapters.iter().map(|a| a.name.as_str()).collect();
+    let total: u64 = idle.iter().map(|(r, _, _)| r.mib).sum();
+    let stale: u64 = idle.iter().filter(|(_, v, _)| *v == Verdict::Stale).map(|(r, _, _)| r.mib).sum();
+    println!(
+        "{}: {} process(es) held {} MiB without using the GPU for {}s; {} MiB of it looks stale",
+        names.join(", "),
+        idle.len(),
+        thousands(total),
+        window,
+        thousands(stale)
+    );
+    if idle.is_empty() {
+        return Ok(());
+    }
+    let width = if o.wide { usize::MAX } else { crate::width() };
+    println!("{:>7} {:>9}  {:<11}  {:<7}  {:<44}  WHY / COMMAND", "PID", "VRAM MiB", "STARTED", "VERDICT", "OWNER");
+    for (r, v, why) in &idle {
+        let line = format!(
+            "{:>7} {:>9}  {:<11}  {:<7}  {:<44}  {why}: {}",
+            r.pid,
+            thousands(r.mib),
+            r.started.map(fmt_short).unwrap_or_default(),
+            if *v == Verdict::Stale { "stale" } else { "idle" },
+            ellipsize(&owner_text(r), 44),
+            command_text(r)
+        );
+        println!("{}", ellipsize(&line, width));
+    }
+    if stale > 0 {
+        println!("\n`vramorama reclaim` checks the stale ones again and prints the command that would free them.");
+    }
+    Ok(())
+}
+
+/// `vramorama reclaim [PID...]`: check idle holders and print the commands that would free their
+/// memory. vramorama never stops a process itself; whoever runs the printed command decides.
+/// A process is cleared only if it did no GPU work during the window, is not a system process,
+/// and nobody appears to want it (`idle::classify` says stale); `force` also clears idle
+/// processes whose owner may still want them, with a warning. Without PIDs, every stale holder
+/// is checked. Exit code 1 when any named PID is not cleared.
+pub fn reclaim(pids: &[u32], force: bool, window: f64) -> Result<i32, String> {
+    let (_, rows) = observe_window(window, true, 1)?;
+    let pids: Vec<u32> = if pids.is_empty() {
+        // Small holders (browsers, chat apps) are never worth reclaiming unasked.
+        let mut stale: Vec<u32> = rows
+            .iter()
+            .filter(|(r, busiest)| r.mib >= 256 && *busiest < IDLE_UTIL && judge(r).0 == Verdict::Stale)
+            .map(|(r, _)| r.pid)
+            .collect();
+        stale.dedup();
+        if stale.is_empty() {
+            println!("No stale GPU memory holders (checked for {window}s).");
+        }
+        stale
+    } else {
+        pids.to_vec()
+    };
+    let mut code = 0;
+    let mut cleared = Vec::new();
+    for pid in pids {
+        let mine: Vec<&(Row, f64)> = rows.iter().filter(|(r, _)| r.pid == pid).collect();
+        let Some((r, _)) = mine.first() else {
+            println!("{pid}: holds no GPU memory; nothing to free");
+            code = 1;
+            continue;
+        };
+        let mib: u64 = mine.iter().map(|(r, _)| r.mib).sum();
+        let busiest = mine.iter().map(|(_, b)| *b).fold(0.0, f64::max);
+        let (verdict, why) = judge(r);
+        let refuse = if r.note.is_some() || is_host(&r.name) {
+            Some("it is a system or protected process".to_string())
+        } else if busiest >= IDLE_UTIL {
+            Some(format!("it used the GPU ({busiest:.0}%) during the last {window}s"))
+        } else if verdict != Verdict::Stale && !force {
+            Some(format!("{why}; add --force to include it anyway"))
+        } else {
+            None
+        };
+        match refuse {
+            Some(reason) => {
+                println!("{pid} {}: leave it: {reason}", r.name);
+                code = 1;
+            }
+            None => {
+                let warn =
+                    if verdict == Verdict::Stale { String::new() } else { " WARNING: may still be wanted".into() };
+                println!("{pid} {}: {} MiB, idle, {why}{warn}", r.name, thousands(mib));
+                println!("    {}", command_text(r));
+                cleared.push((pid, mib, r.started));
+            }
+        }
+    }
+    if !cleared.is_empty() {
+        let total: u64 = cleared.iter().map(|(_, m, _)| m).sum();
+        let ids: Vec<String> = cleared.iter().map(|(p, _, _)| p.to_string()).collect();
+        println!("\nTo free {} MiB, run (PowerShell): Stop-Process -Id {}", thousands(total), ids.join(","));
+        let starts: Vec<String> =
+            cleared.iter().map(|(p, _, s)| format!("{p} started {}", s.map(fmt_short).unwrap_or("?".into()))).collect();
+        println!("vramorama never stops processes itself. Pids get reused, so check first that they are still the");
+        println!("processes it checked ({}).", starts.join(", "));
+    }
+    Ok(code)
 }

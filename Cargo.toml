@@ -1,0 +1,19 @@
+[package]
+name = "vramorama"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Who is holding my GPU? Per-process VRAM with the agent session that launched it, for a single workstation."
+license = "MIT"
+repository = "https://github.com/patrickdugan/vramorama"
+readme = "README.md"
+keywords = ["gpu", "vram", "nvidia", "monitoring", "agents"]
+categories = ["command-line-utilities", "development-tools"]
+
+# Intentionally empty. vramorama uses no third-party crates; see "Supply chain" in the README.
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

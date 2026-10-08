@@ -1,0 +1,54 @@
+# No third-party actions: the checkout is plain git, and the Rust toolchain is the one
+# preinstalled on GitHub's runners. The build never contacts a crate registry (--offline).
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        shell: bash
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
+      - name: Toolchain
+        run: rustc -V; cargo -V
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --all-targets --locked --offline -- -D warnings
+      - name: Test
+        run: cargo test --locked --offline
+      - name: Build release
+        run: cargo build --release --locked --offline
+      - name: Smoke run
+        shell: bash
+        run: |
+          ./target/release/vramorama.exe --version
+          # Hosted runners have no GPU; ps must still exit cleanly or explain why it cannot.
+          if ./target/release/vramorama.exe ps --all; then
+            echo "::notice::ps ran on the runner"
+          else
+            echo "::notice::ps exited $? on a runner without GPU counters"
+          fi
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
+      - name: Test
+        run: cargo test --locked --offline
+      - name: Build without warnings
+        run: RUSTFLAGS="-D warnings" cargo build --locked --offline

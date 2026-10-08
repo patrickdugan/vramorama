@@ -130,13 +130,12 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
             if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_err() {
                 return Ok(0);
             }
-            match hook::check(&input) {
-                Some(reason) => {
-                    eprintln!("{reason}");
-                    Ok(2)
-                }
-                None => Ok(0),
+            if !hook::should_block(&input) {
+                return Ok(0);
             }
+            let exe = std::env::current_exe().map_or_else(|_| "vramorama".into(), |p| p.display().to_string());
+            eprintln!("{}", hook::reason(&exe));
+            Ok(2)
         }
         "report" => {
             let o = parse_opts(rest)?;

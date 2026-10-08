@@ -39,7 +39,9 @@ pid 8352 python.exe  started 10-08 12:26  in C:\Users\me\GitHub\bench
 cargo install --locked --git https://github.com/patrickdugan/vramorama
 ```
 
-Or clone and `cargo build --release --locked --offline`. Both Windows Rust toolchains work: MSVC
+`cargo install` puts it in `%USERPROFILE%\.cargo\bin`. Or clone, `cargo build --release --locked --offline`,
+and copy `target\release\vramorama.exe` to a folder on your `PATH` (for example
+`%LOCALAPPDATA%\Programs\vramorama`). Both Windows Rust toolchains work: MSVC
 (with its usual Build Tools linker) and GNU (self-contained, no Visual Studio needed). Nothing else
 is required: no SDK headers, no import libraries beyond what Rust itself links.
 
@@ -146,7 +148,7 @@ command launches through WMI (`Invoke-CimMethod`/`Invoke-WmiMethod … Win32_Pro
 `wmic process call create`) or Task Scheduler without passing its environment, it exits 2 and
 explains on stderr how to use `vramorama run --detach` or pass the environment. Claude Code blocks
 the call and shows the agent that explanation. Everything else passes silently, and a hook that
-cannot read its input passes too. Add it to `~/.claude/settings.json` (vramorama on `PATH`):
+cannot read its input passes too. The explanation names vramorama by its absolute path, so agents in sessions that started before it was on `PATH` can still follow it. Add it to `~/.claude/settings.json`, using the absolute path to the exe so the hook does not depend on `PATH` either:
 
 ```json
 {
@@ -154,7 +156,7 @@ cannot read its input passes too. Add it to `~/.claude/settings.json` (vramorama
     "PreToolUse": [
       {
         "matcher": "Bash|PowerShell",
-        "hooks": [{ "type": "command", "command": "vramorama", "args": ["hook"] }]
+        "hooks": [{ "type": "command", "command": "C:/Users/you/AppData/Local/Programs/vramorama/vramorama.exe", "args": ["hook"], "timeout": 10 }]
       }
     ]
   }

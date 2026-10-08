@@ -8,7 +8,7 @@ use crate::Opts;
 use crate::gpu::{self, Adapter, Sample, Sampler};
 use crate::json::{Value, obj};
 use crate::owner::{Owner, short};
-use crate::parse::{args_tail, basename, ellipsize, needles, thousands};
+use crate::parse::{args_tail, basename, duration, ellipsize, needles, thousands};
 use crate::procs;
 use crate::scan::{Row, Scanner, adapter_json, is_host, pick_adapters};
 use crate::sys::{filetime_to_unix, fmt_short, fmt_utc, now_filetime, unix_to_filetime};
@@ -163,8 +163,9 @@ fn render_marks(marks: &HashMap<String, Mark>, width: usize) -> String {
 
 fn owner_text(r: &Row) -> String {
     let o: &Owner = &r.owner;
+    let lease = o.lease.as_deref().map(|l| format!(" #{l}")).unwrap_or_default();
     if let Some(l) = &o.label {
-        return l.clone();
+        return format!("{l}{lease}");
     }
     if let Some(s) = &o.session {
         let state = match r.harness_live {
@@ -173,10 +174,13 @@ fn owner_text(r: &Row) -> String {
             None => "",
         };
         let title = r.title.as_deref().map(|t| format!(" “{t}”")).unwrap_or_default();
-        return format!("claude {}{state}{title}", short(s));
+        return format!("claude {}{state}{lease}{title}", short(s));
     }
     if let Some(a) = &o.agent {
-        return a.clone();
+        return format!("{a}{lease}");
+    }
+    if let Some(l) = &o.lease {
+        return format!("lease {l}");
     }
     match (&r.root, r.note) {
         (_, Some(_)) => "unknown".into(),
@@ -184,7 +188,6 @@ fn owner_text(r: &Row) -> String {
         (None, None) => "untagged".into(),
     }
 }
-
 fn command_text(r: &Row) -> String {
     let mut s = r.name.clone();
     if let Some(cwd) = &r.cwd {
@@ -360,14 +363,4 @@ pub fn trace(pid: u32) -> Result<(), String> {
         println!("            via {} {via}: {}", table[&via].exe, h.needle);
     }
     Ok(())
-}
-
-/// "4s", "12m", "3h05m"
-fn duration(secs: f64) -> String {
-    let s = secs.max(0.0).round() as u64;
-    match s {
-        0..60 => format!("{s}s"),
-        60..3600 => format!("{}m", s / 60),
-        _ => format!("{}h{:02}m", s / 3600, s / 60 % 60),
-    }
 }

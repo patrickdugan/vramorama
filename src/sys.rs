@@ -167,7 +167,9 @@ pub struct ProcHandle(pub Handle);
 impl ProcHandle {
     pub fn open(pid: u32, access: u32) -> Option<ProcHandle> {
         let h = unsafe { OpenProcess(access, 0, pid) };
-        (h != 0).then_some(ProcHandle(h))
+        // Not `then_some(ProcHandle(h))`: that builds and drops a ProcHandle(0) on failure, and its
+        // CloseHandle overwrites the error code callers read with GetLastError.
+        if h == 0 { None } else { Some(ProcHandle(h)) }
     }
 }
 

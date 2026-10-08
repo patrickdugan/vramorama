@@ -17,6 +17,8 @@ pub struct Owner {
     pub harness_pid: Option<u32>,
     /// `AI_AGENT`, a harness-neutral marker some agents set (Claude Code: `claude-code_<ver>_agent`).
     pub agent: Option<String>,
+    /// The `vramorama run` lease the process was started under (inherited by its children).
+    pub lease: Option<String>,
 }
 
 impl Owner {
@@ -32,11 +34,12 @@ impl Owner {
             session: get(CLAUDE_SESSION),
             harness_pid: get(CLAUDE_PID).and_then(|v| v.parse().ok()),
             agent: get(AI_AGENT),
+            lease: get(crate::ledger::LEASE_VAR),
         }
     }
 
     pub fn is_tagged(&self) -> bool {
-        self.label.is_some() || self.session.is_some() || self.agent.is_some()
+        self.label.is_some() || self.session.is_some() || self.agent.is_some() || self.lease.is_some()
     }
 
     /// Short stable key for grouping: the label, else `claude:<first 8 of session>`, else the agent.
@@ -47,7 +50,7 @@ impl Owner {
         if let Some(s) = &self.session {
             return Some(format!("claude:{}", short(s)));
         }
-        self.agent.clone()
+        self.agent.clone().or_else(|| self.lease.as_ref().map(|l| format!("lease:{l}")))
     }
 }
 
@@ -70,7 +73,9 @@ mod tests {
             ("CLAUDE_CODE_SESSION_ID", "5f3c1e2a-7d41-4b8e-9a6c-1e2f3a4b5c6d"),
             ("CLAUDE_PID", "41200"),
             ("AI_AGENT", "claude-code_2-1-293_agent"),
+            ("VRAMORAMA_LEASE", "ab12cd34"),
         ]));
+        assert_eq!(o.lease.as_deref(), Some("ab12cd34"));
         assert_eq!(o.session.as_deref(), Some("5f3c1e2a-7d41-4b8e-9a6c-1e2f3a4b5c6d"));
         assert_eq!(o.harness_pid, Some(41200));
         assert_eq!(o.key().as_deref(), Some("claude:5f3c1e2a"));
@@ -84,5 +89,7 @@ mod tests {
         let o = Owner::from_env(&env(&[("VRAMORAMA_OWNER", "  "), ("PATH", "x")]));
         assert!(!o.is_tagged());
         assert_eq!(o.key(), None);
+        let o = Owner::from_env(&env(&[("VRAMORAMA_LEASE", "ab12cd34")]));
+        assert_eq!(o.key().as_deref(), Some("lease:ab12cd34"));
     }
 }

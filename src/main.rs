@@ -3,7 +3,9 @@
 // Off Windows only `report` exists, so most of the shared code is unused there.
 #![cfg_attr(not(windows), allow(dead_code))]
 
+mod hook;
 mod json;
+mod ledger;
 mod owner;
 mod parse;
 mod report;
@@ -15,6 +17,8 @@ mod app;
 mod gpu;
 #[cfg(windows)]
 mod procs;
+#[cfg(windows)]
+mod run;
 #[cfg(windows)]
 mod scan;
 #[cfg(windows)]
@@ -33,6 +37,16 @@ USAGE
       Summarise a watch log: GiB-hours, peak and time held per owner.
   vramorama trace PID
       Find the agent transcript whose session launched PID (for untagged processes).
+  vramorama run --vram SIZE [--owner NAME] [--detach [--out FILE]] [--wait SECS]
+                [--settle SECS] [--headroom MIB] [--adapter NAME] [--quiet] -- COMMAND...
+      Wait until SIZE (e.g. 9G, 6000M) fits on the card, first come first served, then
+      run COMMAND tagged VRAMORAMA_LEASE=<id> and keep the reservation until it and its
+      children exit. --detach starts it outside this session (output to --out).
+  vramorama leases [--json] [--headroom MIB] [--adapter NAME]
+      Current leases, and how much a new request could get now.
+  vramorama hook
+      Claude Code PreToolUse hook: blocks WMI / Task Scheduler launches that would
+      strip a job's session tags (exit code 2 with the reason on stderr).
 
 OPTIONS
   --json        machine-readable output
@@ -40,6 +54,8 @@ OPTIONS
   --min MIB     hide processes holding less than MIB (default 16)
   --wide        do not truncate to the console width
   --trace       run `trace` for every untagged process
+  --headroom    MiB left free for the desktop and drivers when admitting (default 512)
+  --settle      seconds the memory must stay free before admission (default 5)
 
 OWNERSHIP
   A process is tagged by environment variables it inherited:
@@ -60,11 +76,13 @@ pub struct Opts {
     pub interval: f64,
     pub log: Option<String>,
     pub quiet: bool,
+    pub headroom_mib: u64,
+    pub adapter: Option<String>,
     pub positional: Vec<String>,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
-    let mut o = Opts { min_mib: 16, interval: 5.0, ..Default::default() };
+    let mut o = Opts { min_mib: 16, interval: 5.0, headroom_mib: 512, ..Default::default() };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = |name: &str| it.next().cloned().ok_or(format!("{name} needs a value"));
@@ -82,6 +100,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 }
             }
             "--log" => o.log = Some(value("--log")?),
+            "--adapter" => o.adapter = Some(value("--adapter")?),
+            "--headroom" => o.headroom_mib = value("--headroom")?.parse().map_err(|_| "--headroom takes MiB")?,
             s if s.starts_with('-') => return Err(format!("unknown option {s}; see --help")),
             s => o.positional.push(s.to_string()),
         }
@@ -89,7 +109,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
     Ok(o)
 }
 
-fn run(args: &[String]) -> Result<(), String> {
+fn dispatch(args: &[String]) -> Result<i32, String> {
     let (cmd, rest) = match args.first().map(String::as_str) {
         None => ("ps", args),
         Some(s) if s.starts_with('-') && !matches!(s, "-h" | "--help" | "-V" | "--version") => ("ps", args),
@@ -98,11 +118,25 @@ fn run(args: &[String]) -> Result<(), String> {
     match cmd {
         "-h" | "--help" | "help" => {
             print!("{HELP}");
-            Ok(())
+            Ok(0)
         }
         "-V" | "--version" | "version" => {
             println!("vramorama {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
+            Ok(0)
+        }
+        "hook" => {
+            // A hook that fails must not block the agent, so unreadable input is a pass.
+            let mut input = String::new();
+            if std::io::Read::read_to_string(&mut std::io::stdin(), &mut input).is_err() {
+                return Ok(0);
+            }
+            match hook::check(&input) {
+                Some(reason) => {
+                    eprintln!("{reason}");
+                    Ok(2)
+                }
+                None => Ok(0),
+            }
         }
         "report" => {
             let o = parse_opts(rest)?;
@@ -114,9 +148,10 @@ fn run(args: &[String]) -> Result<(), String> {
             } else {
                 print!("{}", report::render(&r, if o.wide { usize::MAX } else { width() }));
             }
-            Ok(())
+            Ok(0)
         }
-        "ps" | "watch" | "trace" => os_command(cmd, parse_opts(rest)?),
+        "run" => os_run(rest),
+        "ps" | "watch" | "trace" | "leases" => os_command(cmd, parse_opts(rest)?).map(|()| 0),
         other => Err(format!("unknown command {other}; see --help")),
     }
 }
@@ -126,11 +161,67 @@ fn os_command(cmd: &str, o: Opts) -> Result<(), String> {
     match cmd {
         "ps" => app::ps(&o),
         "watch" => app::watch(&o),
+        "leases" => run::leases(o.json, o.adapter.as_deref(), o.headroom_mib),
         _ => {
             let [pid] = o.positional.as_slice() else { return Err("usage: vramorama trace PID".into()) };
             app::trace(pid.parse().map_err(|_| format!("not a pid: {pid}"))?)
         }
     }
+}
+
+/// `run` options come before `--`; everything after it is the command.
+#[cfg(windows)]
+fn os_run(args: &[String]) -> Result<i32, String> {
+    let split = args.iter().position(|a| a == "--");
+    let (flags, argv) = match split {
+        Some(i) => (&args[..i], args[i + 1..].to_vec()),
+        None => return Err("usage: vramorama run --vram SIZE [options] -- COMMAND...".into()),
+    };
+    if argv.is_empty() {
+        return Err("no command after --".into());
+    }
+    let mut o = run::RunOpts {
+        vram_mib: 0,
+        owner: None,
+        detach: false,
+        out: None,
+        wait_secs: None,
+        settle_secs: 5.0,
+        headroom_mib: 512,
+        adapter: None,
+        quiet: false,
+        argv,
+    };
+    let mut it = flags.iter();
+    while let Some(a) = it.next() {
+        let mut value = |name: &str| it.next().cloned().ok_or(format!("{name} needs a value"));
+        let secs =
+            |s: String, name: &str| s.parse::<f64>().ok().filter(|v| *v >= 0.0).ok_or(format!("{name} takes seconds"));
+        match a.as_str() {
+            "--vram" => o.vram_mib = ledger::parse_size_mib(&value("--vram")?)?,
+            "--owner" => o.owner = Some(value("--owner")?),
+            "--detach" => o.detach = true,
+            "--out" => o.out = Some(value("--out")?),
+            "--wait" => o.wait_secs = Some(secs(value("--wait")?, "--wait")?),
+            "--settle" => o.settle_secs = secs(value("--settle")?, "--settle")?,
+            "--headroom" => o.headroom_mib = value("--headroom")?.parse().map_err(|_| "--headroom takes MiB")?,
+            "--adapter" => o.adapter = Some(value("--adapter")?),
+            "--quiet" | "-q" => o.quiet = true,
+            s => return Err(format!("unknown run option {s}; see --help")),
+        }
+    }
+    if o.vram_mib == 0 {
+        return Err("run needs --vram SIZE (for example --vram 9G)".into());
+    }
+    if o.out.is_some() && !o.detach {
+        return Err("--out only applies with --detach".into());
+    }
+    run::run(&o)
+}
+
+#[cfg(not(windows))]
+fn os_run(_args: &[String]) -> Result<i32, String> {
+    Err("`run` needs Windows in this version; a Linux (NVML) backend is planned.".into())
 }
 
 #[cfg(not(windows))]
@@ -150,8 +241,11 @@ fn width() -> usize {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Err(e) = run(&args) {
-        eprintln!("vramorama: {e}");
-        std::process::exit(2);
+    match dispatch(&args) {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("vramorama: {e}");
+            std::process::exit(2);
+        }
     }
 }

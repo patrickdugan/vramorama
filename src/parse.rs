@@ -141,6 +141,62 @@ pub fn parse_iso_utc(s: &str) -> Option<f64> {
     Some((days * 86_400 + h * 3600 + mi * 60 + se - offset) as f64 + frac)
 }
 
+/// Standard base64 with padding (for PowerShell's `-EncodedCommand`).
+pub fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n =
+            (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            out.push(if i <= c.len() { T[(n >> shift & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+/// Join arguments into a Windows command line (CommandLineToArgvW quoting).
+pub fn join_args(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| {
+            if !a.is_empty() && !a.contains([' ', '\t', '"']) {
+                return a.clone();
+            }
+            let mut q = String::from("\"");
+            let mut slashes = 0;
+            for ch in a.chars() {
+                match ch {
+                    '\\' => slashes += 1,
+                    '"' => {
+                        q.push_str(&"\\".repeat(slashes * 2 + 1));
+                        q.push('"');
+                        slashes = 0;
+                    }
+                    c => {
+                        q.push_str(&"\\".repeat(slashes));
+                        q.push(c);
+                        slashes = 0;
+                    }
+                }
+            }
+            q.push_str(&"\\".repeat(slashes * 2));
+            q.push('"');
+            q
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// "4s", "12m", "3h05m"
+pub fn duration(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s / 60),
+        _ => format!("{}h{:02}m", s / 3600, s / 60 % 60),
+    }
+}
+
 /// Shorten for a fixed-width column, marking the cut.
 pub fn ellipsize(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -222,6 +278,18 @@ mod tests {
         let n = needles(r"cmd.exe /c C:\py.exe -u scripts\run_queue.py --queue q.yaml > out\u6.out 2>&1");
         assert!(n.contains(&r"C:\py.exe -u scripts\run_queue.py --queue q.yaml".to_string()));
         assert!(needles("python.exe -u x.py").is_empty());
+    }
+
+    #[test]
+    fn base64_and_quoting() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar!"), "Zm9vYmFyIQ==");
+        let argv: Vec<String> =
+            ["python.exe", "-c", r#"print("a b")"#, r"C:\dir with space\", ""].map(String::from).into();
+        assert_eq!(join_args(&argv), r#"python.exe -c "print(\"a b\")" "C:\dir with space\\" """#);
     }
 
     #[test]

@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vramorama</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --surface-2: #f3f2ee;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+  --track: #ecebe6;
+  --elsewhere: #c3c2b7;
+  --wash: rgba(11, 11, 11, 0.07);
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --other: #898781;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --good-text: #006300;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321;
+    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10);
+    --track: #2a2a28; --elsewhere: #5a5955; --wash: rgba(255, 255, 255, 0.08);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --s5: #d55181; --s6: #008300; --s7: #9085e9; --other: #6f6e69;
+    --good-text: #0ca30c;
+    --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321;
+  --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10);
+  --track: #2a2a28; --elsewhere: #5a5955; --wash: rgba(255, 255, 255, 0.08);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+  --s5: #d55181; --s6: #008300; --s7: #9085e9; --other: #6f6e69;
+  --good-text: #0ca30c;
+  --shadow: none;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--page);
+  color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1280px; margin: 0 auto; padding: 20px 24px 48px; }
+@media (max-width: 640px) { .wrap { padding: 12px 16px 32px; } }
+
+header.top { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
+.brand { display: flex; align-items: baseline; gap: 10px; margin-right: auto; }
+.brand b { font-size: 18px; letter-spacing: -0.01em; }
+.brand span { color: var(--muted); }
+.live { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 13px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); flex: none; }
+.dot.off { background: var(--critical); }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface); }
+.seg button { border: 0; background: transparent; color: var(--ink-2); font: inherit; font-size: 13px; padding: 5px 12px; cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--surface-2); color: var(--ink); font-weight: 600; }
+.seg button:focus-visible, button:focus-visible { outline: 2px solid var(--s1); outline-offset: 1px; }
+.iconbtn { border: 1px solid var(--border); background: var(--surface); color: var(--ink-2); border-radius: 8px; padding: 5px 10px; font: inherit; font-size: 13px; cursor: pointer; }
+
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); padding: 18px 20px; margin-bottom: 16px; }
+.card h2 { font-size: 14px; font-weight: 600; margin: 0; }
+.card .sub { color: var(--muted); font-size: 13px; margin: 2px 0 0; }
+.card-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.card-head .sub { margin: 0; }
+
+.hero { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 32px; margin: 4px 0 16px; }
+.hero .big { font-size: 48px; font-weight: 600; line-height: 1; letter-spacing: -0.02em; }
+.hero .of { color: var(--ink-2); font-size: 15px; margin-left: 6px; }
+.tiles { display: flex; flex-wrap: wrap; gap: 8px 28px; margin-left: auto; }
+.tile .label { color: var(--muted); font-size: 12px; }
+.tile .value { font-size: 20px; font-weight: 600; }
+.tile .value small { font-size: 13px; font-weight: 400; color: var(--ink-2); margin-left: 3px; }
+
+.bar { display: flex; height: 20px; gap: 2px; border-radius: 4px; overflow: hidden; background: var(--surface); }
+.bar > div { height: 100%; min-width: 2px; }
+.bar > div:first-child { border-radius: 4px 0 0 4px; }
+.bar > div:last-child { border-radius: 0 4px 4px 0; }
+.bar .free { background: var(--track); flex: 1 1 auto; }
+.bar .elsewhere { background: var(--elsewhere); }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 12px; font-size: 13px; color: var(--ink-2); }
+.legend .item { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; }
+.legend .item b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.sw { width: 10px; height: 10px; border-radius: 3px; flex: none; display: inline-block; }
+.sw.line { width: 14px; height: 3px; border-radius: 2px; }
+.trunc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.chart { position: relative; }
+.chart svg { display: block; width: 100%; overflow: visible; }
+.chart .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+.axis text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.tip {
+  position: absolute; pointer-events: none; background: var(--surface); color: var(--ink);
+  border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.16);
+  padding: 8px 10px; font-size: 12px; min-width: 180px; max-width: 320px; z-index: 5;
+}
+.tip .t { color: var(--muted); margin-bottom: 4px; }
+.tip .row { display: flex; align-items: center; gap: 8px; }
+.tip .row .n { margin-left: auto; padding-left: 12px; font-variant-numeric: tabular-nums; font-weight: 600; }
+.tip .row .l { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.tablewrap { overflow-x: auto; margin: 0 -20px; padding: 0 20px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 6px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+td { padding: 8px 10px; border-bottom: 1px solid var(--grid); vertical-align: middle; }
+tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12px; color: var(--ink-2); max-width: 420px; }
+.owner { display: flex; align-items: center; gap: 8px; min-width: 220px; max-width: 360px; }
+.owner .name { font-weight: 500; }
+.owner .title { color: var(--ink-2); }
+.minibar { display: inline-block; vertical-align: middle; width: 56px; height: 6px; border-radius: 3px; background: var(--track); margin-left: 8px; overflow: hidden; }
+.minibar i { display: block; height: 100%; border-radius: 3px; }
+.chip { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; white-space: nowrap; color: var(--ink-2); }
+.chip .ic { font-size: 11px; line-height: 1; }
+.chip.stale { color: var(--ink); font-weight: 600; }
+.chip.stale .ic { color: var(--serious); }
+.chip.active .ic { color: var(--good); }
+.chip.idle .ic { color: var(--warning); }
+.badge { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 9px; border: 1px solid var(--border); color: var(--ink-2); line-height: 17px; white-space: nowrap; }
+.actions { display: flex; gap: 6px; justify-content: flex-end; }
+.actions button { border: 1px solid var(--border); background: var(--surface); color: var(--ink); border-radius: 6px; padding: 3px 9px; font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap; }
+.actions button:hover, .iconbtn:hover { background: var(--surface-2); }
+
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+.grid2 .card { margin-bottom: 0; }
+.note { color: var(--muted); font-size: 13px; }
+code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12px; background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
+footer { color: var(--muted); font-size: 12px; margin-top: 24px; }
+
+dialog { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--ink); padding: 0; width: min(760px, calc(100vw - 32px)); box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3); }
+dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
+dialog .dh { display: flex; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--grid); }
+dialog .dh h3 { margin: 0; font-size: 15px; }
+dialog .dh button { margin-left: auto; }
+dialog .db { padding: 14px 18px 18px; max-height: 70vh; overflow: auto; }
+dl.kv { display: grid; grid-template-columns: 110px 1fr; gap: 6px 12px; margin: 0 0 14px; font-size: 13px; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; overflow-wrap: anywhere; }
+.hit { border: 1px solid var(--grid); border-radius: 8px; padding: 10px 12px; margin-top: 8px; }
+.hit .k { font-weight: 600; }
+.hit .p { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; margin-top: 2px; }
+
+.toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: var(--ink); color: var(--surface); padding: 8px 14px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity 0.2s; pointer-events: none; }
+.toast.on { opacity: 1; }
+.gate { max-width: 560px; margin: 15vh auto; padding: 0 16px; }
+.gate h1 { font-size: 20px; }
+.stale-data { opacity: 0.55; transition: opacity 0.3s; }
+@media (forced-colors: active) { .sw, .bar > div, .minibar i { forced-color-adjust: none; } }
+</style>
+</head>
+<body>
+<div class="wrap" id="app"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<dialog id="trace" aria-labelledby="trace-title"><div class="dh"><h3 id="trace-title">Trace</h3><button class="iconbtn" id="trace-close" type="button">Close</button></div><div class="db" id="trace-body"></div></dialog>
+<script>
+"use strict";
+// ---------- tiny DOM helpers: all text goes through textContent, never innerHTML ----------
+const SVG = "http://www.w3.org/2000/svg";
+function el(tag, props, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") n.className = v;
+    else if (k === "text") n.textContent = v;
+    else if (k === "style") n.style.cssText = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of kids.flat()) if (c != null && c !== false) n.append(c instanceof Node ? c : String(c));
+  return n;
+}
+function sv(tag, attrs) {
+  const n = document.createElementNS(SVG, tag);
+  for (const [k, v] of Object.entries(attrs || {})) if (v != null) n.setAttribute(k, v);
+  return n;
+}
+const fmt = n => Math.round(n).toLocaleString("en-US");
+function dur(s) {
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  return Math.floor(s / 3600) + "h" + String(Math.floor(s / 60) % 60).padStart(2, "0") + "m";
+}
+const clock = ts => new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const hhmm = ts => new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+function started(iso) {
+  if (!iso) return "–";
+  const d = new Date(iso), now = new Date();
+  const t = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return d.toDateString() === now.toDateString() ? t : d.toLocaleDateString([], { month: "short", day: "numeric" }) + " " + t;
+}
+function store(key, val) { try { if (val === undefined) return sessionStorage.getItem(key); sessionStorage.setItem(key, val); } catch (e) { return null; } }
+function toast(msg) { const t = document.getElementById("toast"); t.textContent = msg; t.classList.add("on"); clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove("on"), 2200); }
+async function copy(text, what) {
+  try { await navigator.clipboard.writeText(text); toast("Copied: " + what); }
+  catch (e) { window.prompt("Copy this command:", text); }
+}
+
+// ---------- owner colors: fixed slot order, assigned on first sight, never by rank ----------
+const SLOTS = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7"];
+const slotOf = new Map(JSON.parse(store("vramorama.slots") || "[]"));
+function colorOf(key) {
+  if (!slotOf.has(key)) {
+    const used = new Set(slotOf.values());
+    const free = SLOTS.findIndex((_, i) => !used.has(i));
+    slotOf.set(key, free);
+    store("vramorama.slots", JSON.stringify([...slotOf]));
+  }
+  const i = slotOf.get(key);
+  return i >= 0 ? `var(${SLOTS[i]})` : "var(--other)";
+}
+
+// ---------- state & polling ----------
+const token = new URLSearchParams(location.hash.slice(1)).get("t");
+let now = null, points = [], since = 0, lastOk = 0, failing = false;
+let range = Number(store("vramorama.range") || 900);
+let hoverTs = null;
+
+async function api(path) {
+  const r = await fetch(path, { headers: { "X-Vramorama-Token": token || "" }, cache: "no-store" });
+  if (r.status === 401) throw new Error("token");
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+async function poll() {
+  try {
+    const j = await api("/api/state?since=" + since);
+    if (j.now) now = j.now;
+    for (const p of j.points) points.push(p);
+    if (points.length) since = points[points.length - 1].ts;
+    const cut = (now ? now.ts : Date.now() / 1000) - 3600;
+    while (points.length && points[0].ts < cut) points.shift();
+    lastOk = Date.now(); failing = false;
+    render();
+  } catch (e) {
+    if (e.message === "token") return gate("This page needs the access token from the link that vramorama gui printed.");
+    failing = true; renderStatus();
+  } finally {
+    setTimeout(poll, Math.max(1000, (now ? now.interval : 2) * 1000));
+  }
+}
+
+function gate(msg) {
+  const app = document.getElementById("app");
+  app.replaceChildren(el("div", { class: "gate" },
+    el("h1", { text: "vramorama" }),
+    el("p", { text: msg }),
+    el("p", { class: "note" }, "Run ", el("code", { text: "vramorama gui" }), " and open the link it prints. The token after ", el("code", { text: "#t=" }), " stays in your browser; it is never sent in a URL.")));
+}
+
+// ---------- rendering ----------
+function render() {
+  const app = document.getElementById("app");
+  if (!now) { app.replaceChildren(el("div", { class: "gate" }, el("p", { class: "note", text: "Taking the first sample…" }))); return; }
+  // Re-rendering replaces the DOM; wait while a control has keyboard focus so it is not lost.
+  const focused = document.activeElement;
+  if (focused && focused !== document.body && app.contains(focused) && focused.matches("button")) {
+    if (!render.waiting) { render.waiting = true; focused.addEventListener("blur", () => { render.waiting = false; render(); }, { once: true }); }
+    return;
+  }
+  app.replaceChildren(
+    header(),
+    ...now.adapters.map(adapterCard),
+    timelineCard(),
+    procsCard(),
+    el("div", { class: "grid2" }, ownersCard(), leasesCard()),
+    el("footer", {}, `vramorama ${now.version || ""} · read-only: it shows who holds the GPU and never stops a process · served on 127.0.0.1`)
+  );
+  renderStatus();
+}
+
+function renderStatus() {
+  const s = document.getElementById("status");
+  if (!s) return;
+  const ago = lastOk ? Math.round((Date.now() - lastOk) / 1000) : null;
+  s.replaceChildren(el("span", { class: "dot" + (failing ? " off" : "") }),
+    failing ? "Disconnected: is vramorama gui still running?" : `Live · updated ${ago <= 1 ? "just now" : ago + "s ago"}`);
+  document.getElementById("app").classList.toggle("stale-data", failing);
+}
+setInterval(renderStatus, 1000);
+
+function header() {
+  const theme = store("vramorama.theme");
+  const rangeBtn = (secs, label) => el("button", { type: "button", "aria-pressed": String(range === secs), onclick: () => { range = secs; store("vramorama.range", String(secs)); render(); } }, label);
+  return el("header", { class: "top" },
+    el("div", { class: "brand" }, el("b", { text: "vramorama" }), el("span", { text: "who is holding the GPU" })),
+    el("span", { class: "live", id: "status" }),
+    el("div", { class: "seg", role: "group", "aria-label": "Timeline range" }, rangeBtn(300, "5 min"), rangeBtn(900, "15 min"), rangeBtn(3600, "1 hour")),
+    el("button", { class: "iconbtn", type: "button", title: "Switch light / dark", onclick: () => {
+      const dark = getComputedStyle(document.documentElement).colorScheme === "dark";
+      document.documentElement.dataset.theme = dark ? "light" : "dark"; store("vramorama.theme", document.documentElement.dataset.theme);
+    } }, theme === "dark" ? "Light" : theme === "light" ? "Dark" : "Theme"));
+}
+
+/** Owners on one adapter, largest first, with their combined memory. */
+function ownersOn(a) {
+  const m = new Map();
+  for (const p of a.procs) {
+    const o = m.get(p.owner_key) || { key: p.owner_key, label: p.owner_label, mib: 0 };
+    o.mib += p.mib; m.set(p.owner_key, o);
+  }
+  return [...m.values()].sort((x, y) => y.mib - x.mib);
+}
+
+function adapterCard(a) {
+  const owners = ownersOn(a);
+  const listed = owners.reduce((s, o) => s + o.mib, 0);
+  const elsewhere = Math.max(0, a.used_mib - listed);
+  const total = Math.max(a.total_mib, a.used_mib, 1);
+  const stale = a.procs.filter(p => p.verdict === "stale");
+  const idle = a.procs.filter(p => p.verdict !== "active");
+  const tip = el("div", { class: "tip", hidden: true });
+  const seg = (cls, color, mib, label) => {
+    const d = el("div", { class: cls, style: `flex: 0 0 ${(mib / total) * 100}%;` + (color ? `background:${color}` : "") });
+    d.addEventListener("mousemove", ev => {
+      tip.hidden = false;
+      tip.replaceChildren(el("div", { class: "row" }, color ? el("span", { class: "sw", style: `background:${color}` }) : null, el("span", { class: "l", text: label }), el("span", { class: "n", text: fmt(mib) + " MiB" })),
+        el("div", { class: "t", text: `${((mib / total) * 100).toFixed(1)}% of the card` }));
+      const r = d.parentElement.getBoundingClientRect();
+      tip.style.left = Math.min(ev.clientX - r.left + 12, r.width - 200) + "px"; tip.style.top = "28px";
+    });
+    d.addEventListener("mouseleave", () => { tip.hidden = true; });
+    return d;
+  };
+  const segs = owners.map(o => seg("", colorOf(o.key), o.mib, o.label));
+  if (elsewhere > 0) segs.push(seg("elsewhere", null, elsewhere, "Elsewhere (small processes, drivers, WSL)"));
+  segs.push(el("div", { class: "free", title: `${fmt(total - a.used_mib)} MiB free` }));
+  return el("section", { class: "card", "aria-label": a.name },
+    el("div", { class: "card-head" }, el("h2", { text: a.name }), el("p", { class: "sub", text: `${fmt(a.total_mib)} MiB dedicated` })),
+    el("div", { class: "hero" },
+      el("div", {}, el("span", { class: "big", text: fmt(a.used_mib) }), el("span", { class: "of", text: `of ${fmt(a.total_mib)} MiB in use` })),
+      el("div", { class: "tiles" },
+        tile("Free for a new lease", a.available_mib, "MiB"),
+        tile("Reserved, not yet allocated", now.reserved_mib, "MiB"),
+        tile("Held while idle", idle.reduce((s, p) => s + p.mib, 0), "MiB"),
+        tile("Stale", stale.reduce((s, p) => s + p.mib, 0), "MiB"))),
+    el("div", { class: "chart" }, el("div", { class: "bar", role: "img", "aria-label": `${fmt(a.used_mib)} of ${fmt(a.total_mib)} MiB in use` }, segs), tip),
+    el("div", { class: "legend" },
+      owners.map(o => el("span", { class: "item" }, el("span", { class: "sw", style: `background:${colorOf(o.key)}` }), el("span", { class: "trunc", text: o.label }), el("b", { text: fmt(o.mib) }))),
+      elsewhere > 0 ? el("span", { class: "item" }, el("span", { class: "sw", style: "background:var(--elsewhere)" }), "Elsewhere", el("b", { text: fmt(elsewhere) })) : null,
+      el("span", { class: "item" }, el("span", { class: "sw", style: "background:var(--track)" }), "Free", el("b", { text: fmt(Math.max(0, total - a.used_mib)) }))));
+}
+function tile(label, value, unit) {
+  return el("div", { class: "tile" }, el("div", { class: "label", text: label }), el("div", { class: "value" }, fmt(value), el("small", { text: unit })));
+}
+
+// ---------- timeline: in use (wash) + one 2px line per owner, one axis in MiB ----------
+function timelineCard() {
+  const card = el("section", { class: "card" },
+    el("div", { class: "card-head" }, el("h2", { text: "VRAM by owner" }),
+      el("p", { class: "sub", text: `MiB over the last ${range >= 3600 ? "hour" : range / 60 + " minutes"} · shaded: all memory in use · lines: each owner · top of the axis: the card's capacity` })));
+  const box = el("div", { class: "chart" });
+  card.append(box);
+  const t1 = now.ts, t0 = t1 - range;
+  const pts = points.filter(p => p.ts >= t0);
+  if (pts.length < 2) { box.append(el("div", { class: "empty", text: "Collecting samples… the timeline fills in as vramorama watches." })); return card; }
+  const keys = [];
+  for (const p of pts) for (const k of Object.keys(p.o)) if (!keys.includes(k)) keys.push(k);
+  const labelOf = new Map();
+  for (const o of now.owners) labelOf.set(o.key, o.label);
+  drawTimeline(box, pts, keys, labelOf, t0, t1);
+  card.append(el("div", { class: "legend" },
+    el("span", { class: "item" }, el("span", { class: "sw", style: "background:var(--wash);outline:1px solid var(--axis)" }), "All memory in use"),
+    keys.map(k => el("span", { class: "item" }, el("span", { class: "sw line", style: `background:${colorOf(k)}` }), el("span", { class: "trunc", text: labelOf.get(k) || k })))));
+  return card;
+}
+
+function niceStep(max) {
+  for (const s of [500, 1000, 2000, 4000, 5000, 10000, 20000, 40000]) if (max / s <= 5) return s;
+  return 100000;
+}
+let hoverX = null;
+
+/** Width available inside a card, measured on the page container so the chart can be drawn in the
+ * same pass as everything else (drawing it a frame later made the page jump on every refresh). */
+function cardInnerWidth() {
+  const app = document.getElementById("app"), cs = getComputedStyle(app);
+  return app.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - 42;
+}
+
+function drawTimeline(box, pts, keys, labelOf, t0, t1) {
+  const W = Math.max(cardInnerWidth(), 280), H = 220, padL = 52, padR = keys.length <= 4 ? 120 : 12, padT = 8, padB = 24;
+  const cap = Math.max(now.adapters.reduce((s, a) => s + a.total_mib, 0), ...pts.map(p => p.used), 1);
+  // The top of the axis is the card's capacity, so how full the card is reads directly.
+  const step = niceStep(cap);
+  const top = cap;
+  const x = ts => padL + ((ts - t0) / (t1 - t0)) * (W - padL - padR);
+  const y = v => padT + (1 - v / top) * (H - padT - padB);
+  const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "img", "aria-label": "VRAM in use over time, per owner" });
+  const axis = sv("g", { class: "axis" });
+  for (let v = 0; v <= top; v += step) {
+    axis.append(sv("line", { x1: padL, x2: W - padR, y1: y(v), y2: y(v), stroke: v === 0 ? "var(--axis)" : "var(--grid)", "stroke-width": 1 }));
+    const t = sv("text", { x: padL - 8, y: y(v) + 4, "text-anchor": "end" }); t.textContent = fmt(v); axis.append(t);
+  }
+  const span = t1 - t0, tick = span <= 300 ? 60 : span <= 900 ? 180 : 600;
+  for (let ts = Math.ceil(t0 / tick) * tick; ts <= t1; ts += tick) {
+    const t = sv("text", { x: x(ts), y: H - 6, "text-anchor": "middle" }); t.textContent = hhmm(ts); axis.append(t);
+  }
+  svg.append(axis);
+  // In use: a neutral wash.
+  let area = `M${x(pts[0].ts)},${y(0)}`;
+  for (const p of pts) area += `L${x(p.ts)},${y(p.used)}`;
+  area += `L${x(pts[pts.length - 1].ts)},${y(0)}Z`;
+  svg.append(sv("path", { d: area, fill: "var(--wash)" }));
+  // One line per owner; a missing sample breaks the line instead of drawing a fake drop.
+  const gap = (now.interval || 2) * 3;
+  const ends = [];
+  for (const k of keys) {
+    let d = "", prev = null;
+    for (const p of pts) {
+      const v = p.o[k];
+      if (v == null) { prev = null; continue; }
+      d += (prev && p.ts - prev <= gap ? "L" : "M") + x(p.ts) + "," + y(v);
+      prev = p.ts;
+    }
+    svg.append(sv("path", { d, fill: "none", stroke: colorOf(k), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    const last = [...pts].reverse().find(p => p.o[k] != null);
+    if (last) ends.push({ k, ts: last.ts, v: last.o[k] });
+  }
+  // Direct end labels for up to four owners, if they do not collide.
+  if (keys.length <= 4) {
+    const placed = [];
+    for (const e of ends.sort((a, b) => b.v - a.v)) {
+      const ly = y(e.v);
+      if (placed.some(p => Math.abs(p - ly) < 13)) continue;
+      placed.push(ly);
+      const t = sv("text", { x: x(e.ts) + 8, y: ly + 4, fill: "var(--ink-2)", "font-size": 11 });
+      const lab = labelOf.get(e.k) || e.k;
+      t.textContent = lab.length > 18 ? lab.slice(0, 17) + "…" : lab;
+      svg.append(t);
+    }
+  }
+  // Hover layer: crosshair, ringed dots, tooltip. Values are also in the tables below.
+  const cross = sv("line", { y1: padT, y2: H - padB, stroke: "var(--axis)", "stroke-width": 1, visibility: "hidden" });
+  const dots = sv("g", { visibility: "hidden" });
+  svg.append(cross, dots);
+  const hit = sv("rect", { x: padL, y: padT, width: W - padL - padR, height: H - padT - padB, fill: "transparent" });
+  svg.append(hit);
+  const tip = el("div", { class: "tip", hidden: true });
+  const show = (clientX) => {
+    const r = svg.getBoundingClientRect();
+    const sx = (clientX - r.left) * (W / r.width);
+    const ts = t0 + ((sx - padL) / (W - padL - padR)) * (t1 - t0);
+    let best = pts[0];
+    for (const p of pts) if (Math.abs(p.ts - ts) < Math.abs(best.ts - ts)) best = p;
+    cross.setAttribute("x1", x(best.ts)); cross.setAttribute("x2", x(best.ts)); cross.setAttribute("visibility", "visible");
+    dots.replaceChildren(...keys.filter(k => best.o[k] != null).map(k => sv("circle", { cx: x(best.ts), cy: y(best.o[k]), r: 4, fill: colorOf(k), stroke: "var(--surface)", "stroke-width": 2 })));
+    dots.setAttribute("visibility", "visible");
+    const rows = keys.filter(k => best.o[k] != null).sort((a, b) => best.o[b] - best.o[a]);
+    tip.replaceChildren(el("div", { class: "t", text: clock(best.ts) }),
+      el("div", { class: "row" }, el("span", { class: "sw", style: "background:var(--wash);outline:1px solid var(--axis)" }), el("span", { class: "l", text: "All in use" }), el("span", { class: "n", text: fmt(best.used) })),
+      rows.map(k => el("div", { class: "row" }, el("span", { class: "sw", style: `background:${colorOf(k)}` }), el("span", { class: "l", text: labelOf.get(k) || k }), el("span", { class: "n", text: fmt(best.o[k]) }))));
+    tip.hidden = false;
+    const px = x(best.ts) * (r.width / W);
+    tip.style.left = (px + 14 + 220 > r.width ? px - 14 - tip.offsetWidth : px + 14) + "px";
+    tip.style.top = "6px";
+  };
+  hit.addEventListener("mousemove", ev => { hoverX = ev.clientX; show(ev.clientX); });
+  hit.addEventListener("mouseleave", () => { hoverX = null; tip.hidden = true; cross.setAttribute("visibility", "hidden"); dots.setAttribute("visibility", "hidden"); });
+  box.replaceChildren(svg, tip);
+  // Keep the crosshair where the pointer is when the chart redraws under it.
+  if (hoverX != null) show(hoverX);
+}
+
+// ---------- processes: the table view of everything above ----------
+function procsCard() {
+  const rows = [];
+  for (const a of now.adapters) for (const p of a.procs) rows.push({ a, p });
+  rows.sort((x, y) => y.p.mib - x.p.mib);
+  const card = el("section", { class: "card" },
+    el("div", { class: "card-head" }, el("h2", { text: "Processes holding GPU memory" }),
+      el("p", { class: "sub", text: "Owner comes from tags the process inherited; untagged ones can be traced to the agent session that typed their command." })));
+  if (!rows.length) { card.append(el("p", { class: "note", text: "No process holds GPU memory above the threshold." })); return card; }
+  const head = el("tr", {}, ["Owner", "PID", "VRAM MiB", "Peak", "GPU %", "Status", "Started", "Command", ""].map((h, i) =>
+    el("th", { class: [1, 2, 3, 4].includes(i) ? "num" : "", scope: "col", text: h })));
+  const body = rows.map(({ a, p }) => {
+    const color = colorOf(p.owner_key);
+    const live = p.harness_live === true ? el("span", { class: "badge", text: "session live" }) : p.harness_live === false ? el("span", { class: "badge", text: "session ended" }) : null;
+    const status = p.verdict === "stale"
+      ? el("span", { class: "chip stale", title: p.why }, el("span", { class: "ic", text: "▲" }), "Stale · idle " + dur(p.idle_secs))
+      : p.verdict === "idle"
+        ? el("span", { class: "chip idle", title: p.why || "Idle" }, el("span", { class: "ic", text: "◆" }), "Idle " + dur(p.idle_secs))
+        : el("span", { class: "chip active" }, el("span", { class: "ic", text: "●" }), "Active");
+    const actions = el("div", { class: "actions" });
+    if (!p.session && !p.label && !p.note) actions.append(el("button", { type: "button", onclick: () => openTrace(p.pid), title: "Search agent transcripts for the session that launched it" }, "Trace"));
+    if (p.verdict === "stale") actions.append(el("button", { type: "button", title: "vramorama never stops processes; this copies the command for you to run", onclick: () => copy(`Stop-Process -Id ${p.pid}`, `Stop-Process -Id ${p.pid}`) }, "Copy stop command"));
+    return el("tr", {},
+      el("td", {}, el("div", { class: "owner" }, el("span", { class: "sw", style: `background:${color}` }),
+        el("span", { class: "trunc" }, el("span", { class: "name", text: p.owner_label }), " ", live))),
+      el("td", { class: "num", text: p.pid }),
+      el("td", { class: "num" }, fmt(p.mib), el("span", { class: "minibar", "aria-hidden": "true" }, el("i", { style: `width:${Math.min(100, (p.mib / Math.max(a.total_mib, 1)) * 100)}%;background:${color}` }))),
+      el("td", { class: "num", text: fmt(p.peak_mib) }),
+      el("td", { class: "num", text: p.util == null ? "–" : Math.round(p.util) }),
+      el("td", {}, status),
+      el("td", { style: "white-space:nowrap", text: started(p.started) }),
+      el("td", { class: "mono trunc", title: p.cmd || p.command_text, text: p.command_text }),
+      el("td", {}, actions));
+  });
+  card.append(el("div", { class: "tablewrap" }, el("table", {}, el("thead", {}, head), el("tbody", {}, body))));
+  return card;
+}
+
+function ownersCard() {
+  const card = el("section", { class: "card" },
+    el("div", { class: "card-head" }, el("h2", { text: "Watermark by owner" }), el("p", { class: "sub", text: "since " + hhmm(now.started) })));
+  if (!now.owners.length) { card.append(el("p", { class: "note", text: "Nothing has held GPU memory yet." })); return card; }
+  const head = el("tr", {}, ["Owner", "Now", "Peak", "GiB·h", "Idle GiB·h"].map((h, i) => el("th", { class: i ? "num" : "", scope: "col", text: h })));
+  const body = now.owners.map(o => el("tr", {},
+    el("td", {}, el("div", { class: "owner", style: "min-width:160px" }, el("span", { class: "sw", style: `background:${colorOf(o.key)}` }), el("span", { class: "trunc", text: o.label }))),
+    el("td", { class: "num", text: o.now_mib ? fmt(o.now_mib) : "–" }),
+    el("td", { class: "num", title: "at " + clock(o.peak_ts), text: fmt(o.peak_mib) }),
+    el("td", { class: "num", text: o.gib_hours.toFixed(2) }),
+    el("td", { class: "num", text: o.idle_gib_hours.toFixed(2) })));
+  card.append(el("div", { class: "tablewrap" }, el("table", {}, el("thead", {}, head), el("tbody", {}, body))));
+  return card;
+}
+
+function leasesCard() {
+  const card = el("section", { class: "card" },
+    el("div", { class: "card-head" }, el("h2", { text: "Leases" }), el("p", { class: "sub", text: "jobs started with vramorama run" })));
+  if (!now.leases.length) {
+    card.append(el("p", { class: "note" }, "No leases. Start GPU jobs with ", el("code", { text: "vramorama run --vram 9G -- <command>" }), " so they queue for memory instead of racing for it."));
+    return card;
+  }
+  const head = el("tr", {}, ["Lease", "State", "Reserved", "Using", "Owner", "Age"].map((h, i) => el("th", { class: [2, 3, 5].includes(i) ? "num" : "", scope: "col", text: h })));
+  const body = now.leases.map(l => el("tr", {},
+    el("td", { class: "mono", title: l.cmd, text: l.id }),
+    el("td", {}, el("span", { class: "chip " + (l.state === "admitted" ? "active" : "idle") }, el("span", { class: "ic", text: l.state === "admitted" ? "●" : "◆" }), l.state === "admitted" ? "Admitted" : "Waiting")),
+    el("td", { class: "num", text: fmt(l.vram_mib) }),
+    el("td", { class: "num", text: fmt(l.using_mib) }),
+    el("td", { class: "trunc", style: "max-width:160px", text: l.owner || "–" }),
+    el("td", { class: "num", text: dur(now.ts - l.created) })));
+  card.append(el("div", { class: "tablewrap" }, el("table", {}, el("thead", {}, head), el("tbody", {}, body))));
+  return card;
+}
+
+// ---------- trace dialog ----------
+const dlg = document.getElementById("trace");
+document.getElementById("trace-close").addEventListener("click", () => dlg.close());
+async function openTrace(pid) {
+  const body = document.getElementById("trace-body");
+  document.getElementById("trace-title").textContent = "Trace process " + pid;
+  body.replaceChildren(el("p", { class: "note", text: "Searching agent transcripts…" }));
+  dlg.showModal();
+  let t;
+  try { t = await api("/api/trace?pid=" + pid); } catch (e) { body.replaceChildren(el("p", { text: "Trace failed: " + e.message })); return; }
+  if (t.error) { body.replaceChildren(el("p", { text: t.error })); return; }
+  const chain = t.chain.map(c => `${c.exe} ${c.pid}`).join("  ←  ") + (t.exited_parent ? `  ←  [exited ${t.exited_parent}]` : "");
+  const kv = el("dl", { class: "kv" },
+    el("dt", { text: "Process" }), el("dd", { text: `${t.exe} ${t.pid}, started ${started(t.started)}` }),
+    t.cwd ? [el("dt", { text: "Folder" }), el("dd", { text: t.cwd })] : null,
+    t.cmd ? [el("dt", { text: "Command" }), el("dd", { class: "mono", style: "font-family:ui-monospace,Consolas,monospace;font-size:12px", text: t.cmd })] : null,
+    el("dt", { text: "Launch chain" }), el("dd", { text: chain }),
+    t.session ? [el("dt", { text: "Tagged" }), el("dd", { text: `Claude Code session ${t.session}${t.title ? " “" + t.title + "”" : ""}` })] : null,
+    t.tagged_ancestors.length ? [el("dt", { text: "Tagged parent" }), el("dd", { text: t.tagged_ancestors.map(a => `${a.exe} ${a.pid}: ${a.owner}`).join(", ") })] : null,
+    t.searched != null ? [el("dt", { text: "Searched" }), el("dd", { text: `${t.searched} transcripts modified since ${t.since ? clock(t.since) : "ever"}` })] : null);
+  const out = [kv];
+  if (t.session) out.push(el("p", { class: "note", text: "This process carries its session tag, so no search was needed." }));
+  else if (t.searched == null) out.push(el("p", { class: "note", text: "Nothing distinctive to search for in these command lines." }));
+  else if (!t.hits.length) out.push(el("p", { class: "note", text: "No transcript contains these command lines; it was likely started by hand or by a script." }));
+  else {
+    if (t.hits[0].kind !== "launched") out.push(el("p", { class: "note", text: "No session typed this command before the process started; these only mention it. The launcher may have built it from variables." }));
+    for (const h of t.hits) out.push(el("div", { class: "hit" },
+      el("div", {}, el("span", { class: "chip " + (h.kind === "launched" ? "active" : "idle") }, el("span", { class: "ic", text: h.kind === "launched" ? "●" : "◆" }), h.kind === "launched" ? "Launched by" : "Mentioned by"),
+        " ", el("span", { class: "k", text: `${h.harness} session ${h.session.slice(0, 8)}` }), h.title ? " “" + h.title + "”" : "",
+        h.kind === "launched" && h.lead_secs != null ? el("span", { class: "note", text: ` · tool call ${dur(h.lead_secs)} before the process started` }) : null),
+      el("div", { class: "p", text: `${h.path}:${h.line}` }),
+      el("div", { class: "p", text: `matched ${h.via_exe} ${h.via_pid}: ${h.needle}` })));
+  }
+  body.replaceChildren(...out);
+}
+
+// ---------- start ----------
+const savedTheme = store("vramorama.theme");
+if (savedTheme === "light" || savedTheme === "dark") document.documentElement.dataset.theme = savedTheme;
+if (!token) gate("This page needs the access token from the link that vramorama gui printed.");
+else { render(); poll(); }
+window.addEventListener("resize", () => { clearTimeout(window.rh); window.rh = setTimeout(() => now && render(), 150); });
+</script>
+</body>
+</html>

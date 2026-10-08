@@ -17,6 +17,8 @@ mod app;
 #[cfg(windows)]
 mod gpu;
 #[cfg(windows)]
+mod gui;
+#[cfg(windows)]
 mod procs;
 #[cfg(windows)]
 mod run;
@@ -51,6 +53,10 @@ USAGE
   vramorama idle [--window SECS] [--min MIB] [--json]
       Processes that held memory but did no GPU work for SECS (default 20). Stale means
       the agent session that started it has ended; untagged processes are never stale.
+  vramorama gui [--port N] [--no-open] [--interval SECS] [--all] [--min MIB]
+      A live page in your browser: memory by owner, an hour of history, processes,
+      idle and stale holders, leases, and trace. Served on 127.0.0.1 (default port
+      7787; 0 picks a free one) with an access token; read-only.
   vramorama reclaim [PID...] [--force] [--window SECS]
       Re-check idle holders (all stale ones if no PID is given) and print the command
       that would free their memory. vramorama never stops a process itself.
@@ -88,6 +94,8 @@ pub struct Opts {
     pub window: Option<f64>,
     pub force: bool,
     pub min_given: bool,
+    pub port: Option<u16>,
+    pub no_open: bool,
     pub positional: Vec<String>,
 }
 
@@ -107,6 +115,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 o.min_given = true;
             }
             "--force" => o.force = true,
+            "--no-open" => o.no_open = true,
+            "--port" => o.port = Some(value("--port")?.parse().map_err(|_| "--port takes a number from 0 to 65535")?),
             "--window" => {
                 let w: f64 = value("--window")?.parse().map_err(|_| "--window takes seconds")?;
                 if !(2.0..=3600.0).contains(&w) {
@@ -171,7 +181,7 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         "run" => os_run(rest),
-        "ps" | "watch" | "trace" | "leases" | "idle" => os_command(cmd, parse_opts(rest)?).map(|()| 0),
+        "ps" | "watch" | "trace" | "leases" | "idle" | "gui" => os_command(cmd, parse_opts(rest)?).map(|()| 0),
         "reclaim" => os_reclaim(parse_opts(rest)?),
         other => Err(format!("unknown command {other}; see --help")),
     }
@@ -183,6 +193,13 @@ fn os_command(cmd: &str, o: Opts) -> Result<(), String> {
         "ps" => app::ps(&o),
         "watch" => app::watch(&o),
         "leases" => run::leases(o.json, o.adapter.as_deref(), o.headroom_mib),
+        "gui" => gui::gui(gui::GuiOpts {
+            port: o.port.unwrap_or(7787),
+            open: !o.no_open,
+            interval: if o.interval == 5.0 { 2.0 } else { o.interval },
+            all: o.all,
+            min_mib: o.min_mib,
+        }),
         "idle" => {
             let o = Opts { min_mib: if o.min_given { o.min_mib } else { 256 }, ..o };
             let window = o.window.unwrap_or(20.0);

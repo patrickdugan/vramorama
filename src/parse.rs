@@ -70,9 +70,11 @@ pub fn args_tail(cmdline: &str) -> &str {
 ///
 /// Transcripts store the command the agent typed, which often differs from the final process
 /// command line in argv[0] (a variable, a venv shim) and in interpreter flags like `-u`, so the
-/// candidates drop those. Short candidates are discarded because they match too much.
+/// candidates drop those. Short candidates are discarded because they match too much (a 20-character
+/// `"ping -n 3 127.0.0.1` cut from a cmd.exe wrapper matched sessions that had nothing to do with
+/// the job).
 pub fn needles(cmdline: &str) -> Vec<String> {
-    const MIN: usize = 16;
+    const MIN: usize = 24;
     let tail = args_tail(cmdline);
     let mut out = Vec::new();
     let mut push = |s: &str| {
@@ -95,6 +97,18 @@ pub fn needles(cmdline: &str) -> Vec<String> {
     // Drop a trailing redirection, which agents often add around the real command.
     if let Some(i) = rest.find(" > ").or_else(|| rest.find(" >> ")) {
         push(&rest[..i]);
+    }
+    // Anchors: the script or module being run survives when the rest of the command was built
+    // from variables (`$py -File $script -Arm $arm`), which the full command line never matches.
+    // (From the full tail: the switch-stripping above also strips `-m`.)
+    let toks: Vec<&str> = tail.split_whitespace().map(|t| t.trim_matches('"')).collect();
+    for (i, t) in toks.iter().enumerate() {
+        let lower = t.to_ascii_lowercase();
+        if (lower == "-file" || lower == "-m") && i + 1 < toks.len() {
+            push(&format!("{t} {}", toks[i + 1]));
+        } else if [".py", ".ps1", ".sh", ".bat", ".cmd"].iter().any(|e| lower.ends_with(e)) {
+            push(t);
+        }
     }
     out
 }
@@ -278,6 +292,13 @@ mod tests {
         let n = needles(r"cmd.exe /c C:\py.exe -u scripts\run_queue.py --queue q.yaml > out\u6.out 2>&1");
         assert!(n.contains(&r"C:\py.exe -u scripts\run_queue.py --queue q.yaml".to_string()));
         assert!(needles("python.exe -u x.py").is_empty());
+        let wrapped = needles(r#"cmd.exe /c "ping -n 3 127.0.0.1 > nul & python -u -m gym.train --arm FF-U --seed 2""#);
+        assert!(wrapped.iter().all(|n| n.contains("gym.train")), "{wrapped:?}");
+        let ps =
+            needles(r"powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_rmp_phase0_queue.ps1 -Arm FF-U");
+        assert!(ps.contains(&r"-File scripts\run_rmp_phase0_queue.ps1".to_string()), "{ps:?}");
+        let py = needles(r#""C:\venv\python.exe" -u -m research_gym.scripts.run_cell --arm FF-U --seed 2"#);
+        assert!(py.contains(&"-m research_gym.scripts.run_cell".to_string()), "{py:?}");
     }
 
     #[test]

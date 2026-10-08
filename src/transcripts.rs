@@ -71,6 +71,10 @@ pub struct Hit {
 /// Tool calls are logged when the model emits them, before the tool runs; allow for clock
 /// granularity between the transcript and the process start time.
 const SKEW_SECS: f64 = 5.0;
+/// A tool call that launched a process comes shortly before the process starts. An earlier call
+/// with the same text is only a mention (seen 2026-10-08: a session that had typed a common
+/// `ping -n 3 127.0.0.1` two hours earlier was reported as the launcher).
+const LAUNCH_WINDOW_SECS: f64 = 1800.0;
 
 /// Find transcripts that contain any of the needles (raw command-line text, matched in its
 /// JSON-escaped form since transcripts store commands inside JSON strings). Only files modified at
@@ -97,11 +101,11 @@ pub fn search_in(roots: &[(&'static str, PathBuf)], needles: &[Needle], since_un
             for (at, _) in text.match_indices(esc.as_str()).take(200) {
                 let record = line_around(&text, at);
                 let ts = record_time(record);
-                let before_start = match (ts, needle.started) {
-                    (Some(t), Some(s)) => t <= s + SKEW_SECS,
+                let just_before_start = match (ts, needle.started) {
+                    (Some(t), Some(s)) => t <= s + SKEW_SECS && s - t <= LAUNCH_WINDOW_SECS,
                     _ => true,
                 };
-                let kind = if is_tool_call(record) && before_start { Kind::Launched } else { Kind::Mentioned };
+                let kind = if is_tool_call(record) && just_before_start { Kind::Launched } else { Kind::Mentioned };
                 let lead = ts.zip(needle.started).map(|(t, s)| s - t);
                 let better = match best {
                     None => true,
@@ -209,12 +213,15 @@ mod tests {
         let seen = r#"{"type":"user","timestamp":"2026-10-08T04:30:00Z","message":{"content":[{"type":"tool_result","content":"PID 1 python.exe -u hold.py 768 45"}]}}"#;
         let launch = r#"{"type":"assistant","timestamp":"2026-10-08T04:08:45.120Z","message":{"content":[{"type":"tool_use","input":{"command":"python.exe -u hold.py 768 45"}}]}}"#;
         let later = r#"{"type":"assistant","timestamp":"2026-10-08T06:00:00Z","message":{"content":[{"type":"tool_use","input":{"content":"assert needle == '-u hold.py 768 45'"}}]}}"#;
+        // Typed two hours before the process started: too early to have launched it.
+        let earlier = r#"{"type":"assistant","timestamp":"2026-10-08T02:05:00Z","message":{"content":[{"type":"tool_use","input":{"command":"python.exe -u hold.py 768 45"}}]}}"#;
         std::fs::write(dir.join("watcher.jsonl"), format!("{seen}\n")).unwrap();
         std::fs::write(dir.join("tests-writer.jsonl"), format!("{later}\n")).unwrap();
+        std::fs::write(dir.join("old-session.jsonl"), format!("{earlier}\n")).unwrap();
         std::fs::write(dir.join("launcher.jsonl"), format!("{seen}\n{launch}\n")).unwrap();
         let (n, hits) = search_in(&[("claude", dir.clone())], &needle("-u hold.py 768 45", started), None);
         std::fs::remove_dir_all(&dir).ok();
-        assert_eq!((n, hits.len()), (3, 3));
+        assert_eq!((n, hits.len()), (4, 4));
         assert_eq!((hits[0].session.as_str(), hits[0].kind, hits[0].line), ("launcher", Kind::Launched, 2));
         assert!((hits[0].lead.unwrap() - 2.88).abs() < 1e-6);
         assert!(hits[1..].iter().all(|h| h.kind == Kind::Mentioned));

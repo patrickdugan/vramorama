@@ -49,6 +49,7 @@ is required: no SDK headers, no import libraries beyond what Rust itself links.
 
 | Command | What it does |
 |---|---|
+| `vramorama gui` | A live page in your browser: memory by owner, an hour of history, every process with its owner and idle state, watermarks, leases, and one-click trace. See [The GUI](#the-gui). |
 | `vramorama` / `vramorama ps` | Processes holding GPU memory now, with owner, start time, working folder and command. `--json`, `--all` (include integrated GPUs), `--min MIB` (default 16), `--wide`, `--trace` (trace every untagged process). |
 | `vramorama watch` | Refreshes every `--interval` seconds (default 5) and keeps a **running watermark**: each process's peak and how long it has been idle, and each owner's current and peak total. `--log FILE` appends one JSON line per sample; `--quiet` only logs. |
 | `vramorama report FILE` | Summarises a watch log: GiB-hours (and how many of them were *idle*, held at under 1% GPU), peak, GPU% and time held per owner. Answers "what sat on the card all night?" Gaps (sleep, a stopped watcher) are capped so they do not count as use. `--json`. |
@@ -66,6 +67,33 @@ Start-Process vramorama -ArgumentList "watch","--interval","30","--log","$HOME\v
 # next morning
 vramorama report $HOME\vram.jsonl
 ```
+
+## The GUI
+
+```powershell
+vramorama gui            # opens http://127.0.0.1:7787/#t=<token> in your browser
+vramorama gui --port 0 --no-open   # any free port; just print the link
+```
+
+The page shows, for each GPU, memory in use as a bar split by owner (the agent session, label or
+untagged process holding it), what a new lease could get, and how much is held idle or stale; a
+timeline of each owner's memory over the last 5 minutes to an hour; every process with its owner,
+memory and peak, GPU %, idle time and verdict, start time and command; per-owner watermarks
+(peak, GiB-hours, idle GiB-hours); and the lease ledger. **Trace** on an untagged process runs
+`vramorama trace` and shows the launch chain and the session that launched it. A stale process
+gets **Copy stop command**; the page never stops anything itself.
+
+It is served by vramorama itself, with the standard library's TCP listener, and the page is
+embedded in the binary: no web framework, no scripts or fonts from the network. Access:
+
+- It listens on `127.0.0.1` only and rejects requests whose `Host` is not that address
+  (DNS rebinding).
+- The data endpoints need a random 128-bit token (from the system RNG), printed in the link after
+  `#t=`. Browsers never send the URL fragment to a server, and the page sends the token in a
+  header, which other web pages cannot add to a request without the CORS permission vramorama
+  never grants.
+- Read-only: the API can read state and run `trace`; nothing changes the ledger or touches a
+  process. A content security policy blocks the page from loading or sending anything elsewhere.
 
 ## How ownership works
 
@@ -93,10 +121,13 @@ Agents often detach long jobs so they outlive the session, and the usual trick o
 vramorama shows these as `untagged, via WmiPrvSE.exe …` (while the WMI host lives) or
 `untagged, from <process> (parent exited)`, and `trace` recovers the owner by searching agent
 transcripts (`~/.claude/projects`, `~/.codex/sessions`) for the job's command line, and its
-ancestors' command lines. It reads only transcripts modified after the job started. A session is
-reported as `launched` only if the command appears in one of its tool calls timestamped *before*
-the process started; launches are ranked by how close the call was to the start. Sessions that
-only saw the command in some tool's output, or typed it later, are listed as `mentioned`.
+ancestors' command lines. When an agent built the command from variables, the full line never
+matches, so `trace` also searches for the script or module being run (`-File queue.ps1`,
+`-m package.module`, `train.py`). It reads only transcripts modified after the job started. A
+session is reported as `launched` only if the text appears in one of its tool calls timestamped
+within 30 minutes *before* the process started; launches are ranked by how close the call was.
+Sessions that only saw the command in some tool's output, typed it later, or typed it long before
+are listed as `mentioned`.
 
 To keep tags across a WMI launch, pass your whole environment. `EnvironmentVariables` replaces the
 environment rather than adding to it, so passing only the tags leaves the job without `PATH`:
@@ -206,13 +237,14 @@ vramorama has **no dependencies**: `[dependencies]` is empty, `Cargo.lock` lists
 and there is no `build.rs` and there are no proc macros. `cargo build --locked --offline` works on a
 machine that has never contacted a registry. Windows APIs are declared by hand; only `kernel32` is
 linked, and `pdh.dll`, `dxgi.dll` and `ntdll.dll` are resolved at run time, so no binding crates or
-import libraries are involved. All `unsafe` code is in `src/sys.rs`, `src/gpu.rs` and `src/procs.rs`.
+import libraries are involved. All `unsafe` code is in `src/sys.rs`, `src/gpu.rs`, `src/procs.rs` and the two Windows calls in `src/gui.rs` (the system RNG and opening the browser).
 The WMI fallback of `run --detach` calls the Windows PowerShell that ships with Windows. The CI
 workflow uses no third-party actions (it checks out with plain `git`).
 
 ## Limits
 
-- Windows 10/11 only, except `report` and `hook`, which run anywhere. A Linux backend (NVML) is
+- Windows 10/11 only, except `report` and `hook`, which run anywhere. The GUI needs a browser on
+  the same machine. A Linux backend (NVML) is
   planned.
 - `run` schedules only the jobs started through it, and nothing in vramorama stops or kills a
   process. Other GPU users are respected (their memory counts as in use) but not queued.

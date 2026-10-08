@@ -117,6 +117,13 @@ fn live(l: &Lease, by_lease: &HashMap<String, u64>) -> bool {
     }
 }
 
+/// The live leases, read without the lock and without changing the ledger (for display).
+pub fn live_leases(by_lease: &HashMap<String, u64>) -> Vec<Lease> {
+    ledger::dir()
+        .map(|root| ledger::read_all(&root).into_iter().filter(|l| live(l, by_lease)).collect())
+        .unwrap_or_default()
+}
+
 /// Drop dead leases from the ledger. Call with the lock held.
 fn prune(root: &Path, by_lease: &HashMap<String, u64>) -> Vec<Lease> {
     let (keep, dead): (Vec<Lease>, Vec<Lease>) = ledger::read_all(root).into_iter().partition(|l| live(l, by_lease));

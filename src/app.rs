@@ -115,7 +115,7 @@ struct Mark {
     last: u64,
 }
 
-fn mark_key(r: &Row) -> (String, String) {
+pub fn mark_key(r: &Row) -> (String, String) {
     match r.owner.key() {
         Some(k) => {
             let label = match (&r.owner.session, &r.title) {
@@ -170,7 +170,7 @@ fn render_marks(marks: &HashMap<String, Mark>, width: usize) -> String {
     out
 }
 
-fn owner_text(r: &Row) -> String {
+pub fn owner_text(r: &Row) -> String {
     let o: &Owner = &r.owner;
     let lease = o.lease.as_deref().map(|l| format!(" #{l}")).unwrap_or_default();
     if let Some(l) = &o.label {
@@ -197,7 +197,7 @@ fn owner_text(r: &Row) -> String {
         (None, None) => "untagged".into(),
     }
 }
-fn command_text(r: &Row) -> String {
+pub fn command_text(r: &Row) -> String {
     let mut s = r.name.clone();
     if let Some(cwd) = &r.cwd {
         s.push_str(&format!(" [{}]", basename(cwd)));
@@ -279,59 +279,57 @@ pub fn render(adapters: &[Adapter], sample: &Sample, rows: &[Row], watch: Option
     out
 }
 
-pub fn trace(pid: u32) -> Result<(), String> {
+/// Everything `trace` finds out about a process, for the CLI printer and the GUI.
+pub struct TraceInfo {
+    pub pid: u32,
+    pub exe: String,
+    pub details: procs::Details,
+    pub owner: Owner,
+    pub title: Option<String>,
+    pub transcript: Option<std::path::PathBuf>,
+    /// The process and its live ancestors, nearest first, then the first parent that has exited.
+    pub chain: Vec<(String, u32)>,
+    pub exited: Option<u32>,
+    pub tagged_ancestors: Vec<(String, u32, String)>,
+    /// Transcripts read, and the time they had to be modified after; `None` when nothing was searched.
+    pub search: Option<(usize, Option<f64>)>,
+    /// Hits with the pid whose command line matched.
+    pub hits: Vec<(transcripts::Hit, u32, String)>,
+}
+
+pub fn trace_info(pid: u32) -> Result<TraceInfo, String> {
     let table = procs::snapshot();
     let entry = table.get(&pid).ok_or(format!("no process {pid}"))?;
     let d = procs::details(pid);
-    println!(
-        "pid {pid} {}  started {}{}",
-        entry.exe,
-        d.created.map(fmt_short).unwrap_or("?".into()),
-        d.cwd.as_deref().map(|c| format!("  in {c}")).unwrap_or_default()
-    );
-    if let Some(c) = &d.cmdline {
-        println!("  command   {c}");
-    }
-    if let Some(note) = d.note {
-        println!("  note      {note}");
-    }
     let owner = d.env.as_deref().map(Owner::from_env).unwrap_or_default();
-    if let Some(s) = &owner.session {
-        let title = transcripts::session_title(s);
-        println!("  tagged    Claude Code session {s}{}", title.map(|t| format!(" “{t}”")).unwrap_or_default());
-        if let Some(p) = transcripts::claude_transcript(s) {
-            println!("  transcript {}", p.display());
-        }
-        return Ok(());
+    let (chain, exited) = procs::ancestry(pid, &table);
+    let mut info = TraceInfo {
+        pid,
+        exe: entry.exe.clone(),
+        title: owner.session.as_deref().and_then(transcripts::session_title),
+        transcript: owner.session.as_deref().and_then(transcripts::claude_transcript),
+        owner,
+        chain: std::iter::once(pid).chain(chain.iter().copied()).map(|p| (table[&p].exe.clone(), p)).collect(),
+        exited,
+        tagged_ancestors: Vec::new(),
+        search: None,
+        hits: Vec::new(),
+        details: d,
+    };
+    if info.owner.session.is_some() {
+        return Ok(info);
     }
-    if let Some(l) = owner.label.as_ref().or(owner.agent.as_ref()) {
-        println!("  tagged    {l}");
-    } else {
-        println!(
-            "  tagged    no (no {} / CLAUDE_CODE_SESSION_ID / AI_AGENT in its environment)",
-            crate::owner::LABEL_VAR
-        );
-    }
-
-    let (chain, gone) = procs::ancestry(pid, &table);
-    let mut line: Vec<String> =
-        std::iter::once(pid).chain(chain.iter().copied()).map(|p| format!("{} {p}", table[&p].exe)).collect();
-    if let Some(g) = gone {
-        line.push(format!("[exited {g}]"));
-    }
-    println!("  ancestry  {}", line.join(" <- "));
-
     // Each candidate command line, with the process that ran it and when that process started.
     let mut wanted: Vec<(u32, Needle)> = Vec::new();
     for p in std::iter::once(pid).chain(chain.iter().copied()) {
         if is_host(&table[&p].exe) {
             break;
         }
-        let pd = if p == pid { d.clone() } else { procs::details(p) };
+        let pd = if p == pid { info.details.clone() } else { procs::details(p) };
         if p != pid {
             let o = pd.env.as_deref().map(Owner::from_env).unwrap_or_default();
             if let Some(k) = o.key() {
-                println!("  ancestor  {} {p} is tagged {k}", table[&p].exe);
+                info.tagged_ancestors.push((table[&p].exe.clone(), p, k));
             }
         }
         let Some(cmd) = pd.cmdline else { continue };
@@ -343,26 +341,81 @@ pub fn trace(pid: u32) -> Result<(), String> {
         }
     }
     if wanted.is_empty() {
-        println!("  search    nothing distinctive to search for in these command lines");
-        return Ok(());
+        return Ok(info);
     }
     // The launching session wrote to its transcript when it ran the command, so older files can be skipped.
     let earliest = wanted.iter().filter_map(|(_, n)| n.started).min_by(f64::total_cmp);
     let since_unix = earliest.map(|s| s - 300.0);
     let list: Vec<Needle> = wanted.iter().map(|(_, n)| Needle { text: n.text.clone(), started: n.started }).collect();
     let (scanned, hits) = transcripts::search(&list, since_unix);
+    info.search = Some((scanned, since_unix));
+    info.hits = hits
+        .into_iter()
+        .map(|h| {
+            let via = wanted.iter().find(|(_, n)| n.text == h.needle).map_or(pid, |(p, _)| *p);
+            let via_exe = table.get(&via).map_or_else(|| "?".into(), |e| e.exe.clone());
+            (h, via, via_exe)
+        })
+        .collect();
+    Ok(info)
+}
+
+pub fn trace(pid: u32) -> Result<(), String> {
+    let t = trace_info(pid)?;
+    let d = &t.details;
+    println!(
+        "pid {pid} {}  started {}{}",
+        t.exe,
+        d.created.map(fmt_short).unwrap_or("?".into()),
+        d.cwd.as_deref().map(|c| format!("  in {c}")).unwrap_or_default()
+    );
+    if let Some(c) = &d.cmdline {
+        println!("  command   {c}");
+    }
+    if let Some(note) = d.note {
+        println!("  note      {note}");
+    }
+    if let Some(s) = &t.owner.session {
+        println!(
+            "  tagged    Claude Code session {s}{}",
+            t.title.as_ref().map(|t| format!(" “{t}”")).unwrap_or_default()
+        );
+        if let Some(p) = &t.transcript {
+            println!("  transcript {}", p.display());
+        }
+        return Ok(());
+    }
+    if let Some(l) = t.owner.label.as_ref().or(t.owner.agent.as_ref()) {
+        println!("  tagged    {l}");
+    } else {
+        println!(
+            "  tagged    no (no {} / CLAUDE_CODE_SESSION_ID / AI_AGENT in its environment)",
+            crate::owner::LABEL_VAR
+        );
+    }
+    let mut line: Vec<String> = t.chain.iter().map(|(exe, p)| format!("{exe} {p}")).collect();
+    if let Some(g) = t.exited {
+        line.push(format!("[exited {g}]"));
+    }
+    println!("  ancestry  {}", line.join(" <- "));
+    for (exe, p, k) in &t.tagged_ancestors {
+        println!("  ancestor  {exe} {p} is tagged {k}");
+    }
+    let Some((scanned, since_unix)) = t.search else {
+        println!("  search    nothing distinctive to search for in these command lines");
+        return Ok(());
+    };
     println!(
         "  search    {scanned} transcripts modified since {}",
         since_unix.map_or("ever".into(), |s| fmt_short(unix_to_filetime(s)))
     );
-    if hits.is_empty() {
+    if t.hits.is_empty() {
         println!("  result    no transcript contains these command lines; likely started by hand or by a script");
-    } else if hits[0].kind != Kind::Launched {
+    } else if t.hits[0].0.kind != Kind::Launched {
         println!("  result    no session typed this command before the process started; the sessions below only");
         println!("            mention it (the launcher may have built it from variables: check the earliest)");
     }
-    for h in &hits {
-        let via = wanted.iter().find(|(_, n)| n.text == h.needle).map_or(pid, |(p, _)| *p);
+    for (h, via, via_exe) in &t.hits {
         let lead = match (h.kind, h.lead) {
             (Kind::Launched, Some(l)) => format!(" (tool call {} before the process started)", duration(l)),
             _ => String::new(),
@@ -375,7 +428,7 @@ pub fn trace(pid: u32) -> Result<(), String> {
             h.title.as_deref().map(|t| format!(" “{t}”")).unwrap_or_default()
         );
         println!("            {}:{}", h.path.display(), h.line);
-        println!("            via {} {via}: {}", table[&via].exe, h.needle);
+        println!("            via {via_exe} {via}: {}", h.needle);
     }
     Ok(())
 }
@@ -414,7 +467,7 @@ fn observe_window(window: f64, all: bool, min_mib: u64) -> Result<(Vec<Adapter>,
 }
 
 /// Verdict for an idle row; processes vramorama cannot inspect are never judged stale.
-fn judge(r: &Row) -> (Verdict, String) {
+pub fn judge(r: &Row) -> (Verdict, String) {
     if r.note.is_some() || is_host(&r.name) {
         return (Verdict::Idle, "a system or protected process".into());
     }

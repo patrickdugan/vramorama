@@ -239,6 +239,9 @@ pub fn render(adapters: &[Adapter], sample: &Sample, rows: &[Row], watch: Option
             thousands(listed),
             thousands(used.saturating_sub(listed))
         ));
+        if let Some(w) = crate::spill::warning(&crate::scan::spills(a, sample, rows)) {
+            out.push_str(&format!("  WARNING {w}\n"));
+        }
         if mine.is_empty() {
             out.push_str("  (no process holds memory above the --min threshold)\n\n");
             continue;

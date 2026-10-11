@@ -55,7 +55,7 @@ is required: no SDK headers, no import libraries beyond what Rust itself links.
 | `vramorama report FILE` | Summarises a watch log: GiB-hours (and how many of them were *idle*, held at under 1% GPU), peak, GPU% and time held per owner. Answers "what sat on the card all night?" Gaps (sleep, a stopped watcher) are capped so they do not count as use. `--json`. |
 | `vramorama trace PID` | For an untagged process: its full launch chain, and the agent transcript that typed the command. |
 | `vramorama run --vram 9G -- CMD…` | Waits for a VRAM lease (first come, first served), then runs `CMD` tagged with it. `--detach [--out LOG]` starts it outside the session. See [Sharing the card](#sharing-the-card-vramorama-run). |
-| `vramorama leases` | The lease ledger and how much a new request could get right now. `--json`. |
+| `vramorama leases` | The lease ledger, how much a new request could get right now, memory held by processes outside any lease, and any spill. `--json`. |
 | `vramorama hook` | A Claude Code `PreToolUse` hook that stops WMI / Task Scheduler launches that would strip a job's tags. See [The agent hook](#the-agent-hook). |
 | `vramorama idle` | Processes that held memory but did no GPU work for `--window` seconds (default 20), each judged *stale* or *idle*. See [Idle holders](#idle-holders). |
 | `vramorama reclaim [PID…]` | Re-checks idle holders (all stale ones if no PID is given) and prints the command that would free them. It never stops anything itself. |
@@ -157,10 +157,20 @@ lease 234228b0 pid 42620 (started through WMI, outside this session)
   lease its processes have not allocated yet (a model still loading), which is what stops the next
   job from starting on memory the previous one is about to take. Strict first come, first served:
   a large request at the head of the queue holds back smaller ones, so it cannot be starved.
-- **Settle.** The memory must stay available for `--settle` seconds (default 5) before admission,
-  to ride out other programs' brief dips. `--headroom` (default 512 MiB) is left for the desktop
-  and drivers. `--wait SECS` gives up after a while (exit 2). `--adapter NAME` picks a GPU by name;
-  the default is the one with the most memory.
+- **Settle.** The memory must stay available for `--settle` seconds (default 15) before admission,
+  and the committed total (in use plus reserved) must not grow by more than 256 MiB meanwhile; if
+  it does, the settle period starts again. Leased jobs filling their own reservations do not move
+  the committed total. A job started *without* `vramorama run` that is still loading its model
+  does, and admitting a lease on top of it is how two jobs end up on memory only one of them can
+  have. `--headroom` (default 512 MiB) is left for the desktop and drivers. `--wait SECS` gives up
+  after a while (exit 2). `--adapter NAME` picks a GPU by name; the default is the one with the
+  most memory.
+- **Reservations lapse.** A lease's unallocated remainder counts as reserved for 10 minutes after
+  admission, long enough to start and load a model. After that the lease is charged only for what
+  its processes hold (`leases` shows it as `holding`), so a queue runner that leased memory and
+  sat empty, or a job that asked for more than it uses, does not keep memory from everyone else.
+- **Spill stops admission.** While any process on the card has spilled into system memory (see
+  [Spill](#spill)), nothing is admitted.
 - **The lease tag.** The job runs with `VRAMORAMA_LEASE=<id>` (and `VRAMORAMA_OWNER` with
   `--owner`), inherited by everything it starts, so memory is counted against the lease through
   launcher shims and worker processes. The lease ends when the job and every process carrying the
@@ -173,6 +183,25 @@ lease 234228b0 pid 42620 (started through WMI, outside this session)
 - **The ledger** is one JSON file per lease in `%LOCALAPPDATA%\vramorama\leases`, changed only
   while holding `ledger.lock`, a file opened without sharing. Windows releases that lock when its
   holder exits, even after a crash. Set `VRAMORAMA_HOME` to use another directory.
+
+## Spill
+
+On Windows a discrete card that is full does not fail the next allocation: the driver places it in
+shared (system) memory instead, behind PCIe. Nothing errors and nothing is logged; every kernel that
+touches that memory runs many times slower. Jobs that would have died with `CUDA error: out of
+memory` crawl for hours instead. In one jam a 9 GB fine-tuning job that normally finishes in 75
+minutes made no visible progress in 8 hours, and the jobs sharing the card slowed down with it.
+
+vramorama reads the `GPU Process Memory\Shared Usage` counter alongside dedicated memory. A CUDA
+context alone holds about 80 MiB there and pinned host buffers add some more, so a process counts as
+**spilled** only when it holds at least 512 MiB of shared memory *and* the card's dedicated memory is
+within 1 GiB of full. `ps`, `watch`, `leases` and the GUI then print a warning naming the spilled
+processes, the JSON outputs list them under `spilled`, and `run` admits nothing until the spill clears.
+vramorama still stops nothing itself: pausing a job is your call.
+
+`leases` also says how much memory is held by processes not started through `vramorama run`. Those
+are respected but cannot be queued; when an agent starts GPU jobs directly, that line is where it
+shows.
 
 ## The agent hook
 
@@ -224,7 +253,8 @@ stays with whoever runs the command.
 
 - **Memory and utilisation:** the `GPU Process Memory(*)\Dedicated Usage`, `GPU Engine(*)\Utilization
   Percentage` and `GPU Adapter Memory(*)\Dedicated Usage` performance counters (PDH), which cover
-  every vendor. GPU% is the busiest engine, as in Task Manager.
+  every vendor. GPU% is the busiest engine, as in Task Manager. The `Shared Usage` counters of the
+  same two sets show spill; without them vramorama works as before, minus the spill check.
 - **Adapters:** DXGI, to name each adapter and its dedicated memory. By default only adapters with at
   least 1 GiB of dedicated memory are shown, which hides integrated GPUs; `--all` shows them.
 - **Processes:** a Toolhelp snapshot for the tree; `NtQueryInformationProcess` and
@@ -247,7 +277,11 @@ workflow uses no third-party actions (it checks out with plain `git`).
   the same machine. A Linux backend (NVML) is
   planned.
 - `run` schedules only the jobs started through it, and nothing in vramorama stops or kills a
-  process. Other GPU users are respected (their memory counts as in use) but not queued.
+  process. Other GPU users are respected (their memory counts as in use) but not queued. The settle
+  growth check protects new leases from a job that is still loading, but a job started outside
+  `run` can still start on memory a lease has reserved and push the card into spill.
+- The spill rule is a threshold, not a measurement of where each allocation lives: a process with
+  more than 512 MiB of pinned host buffers on a nearly full card is reported as spilled too.
 - A server that waits idle between requests (an inference server between evaluation batches) is
   *idle* by these rules. The verdict only says nobody appears to own it, not that nobody uses it.
 - A job that allocates more than its lease asked for is not stopped; the excess simply counts as in

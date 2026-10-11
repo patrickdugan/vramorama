@@ -16,6 +16,8 @@ pub struct Row {
     pub pid: u32,
     pub luid: u64,
     pub mib: u64,
+    /// Shared (system) memory mapped for the adapter; see `spill.rs`.
+    pub shared_mib: u64,
     pub util: Option<f64>,
     pub name: String,
     pub started: Option<u64>,
@@ -70,6 +72,7 @@ impl Scanner {
                 pid: u.pid,
                 luid: u.luid,
                 mib: u.dedicated / MIB,
+                shared_mib: u.shared / MIB,
                 util: u.util,
                 name: fixed.name,
                 started: fixed.started,
@@ -162,10 +165,24 @@ pub fn pick_adapters(dxgi: Vec<Adapter>, sample: &Sample, all: bool) -> Vec<Adap
     out
 }
 
+/// Processes on `a` whose allocations spilled into system memory, with how much: (pid, MiB).
+pub fn spills(a: &Adapter, sample: &Sample, rows: &[Row]) -> Vec<(u32, u64)> {
+    let total = a.dedicated / MIB;
+    let used = sample.adapter_used.get(&a.luid).copied().unwrap_or(0) / MIB;
+    let mut out: Vec<(u32, u64)> = rows
+        .iter()
+        .filter(|r| r.luid == a.luid && crate::spill::spilled(r.shared_mib, total, used))
+        .map(|r| (r.pid, r.shared_mib))
+        .collect();
+    out.sort_by_key(|x| std::cmp::Reverse(x.1));
+    out
+}
+
 pub fn row_json(r: &Row) -> Value {
     obj([
         ("pid", r.pid.into()),
         ("mib", r.mib.into()),
+        ("shared_mib", r.shared_mib.into()),
         ("util", r.util.map(|u| (u * 10.0).round() / 10.0).into()),
         ("name", r.name.as_str().into()),
         ("started", r.started.map(crate::sys::fmt_utc).into()),
@@ -190,6 +207,12 @@ pub fn adapter_json(a: &Adapter, sample: &Sample, rows: &[Row]) -> Value {
         ("vendor", format!("0x{:04X}", a.vendor).into()),
         ("total_mib", (a.dedicated / MIB).into()),
         ("used_mib", sample.adapter_used.get(&a.luid).map(|b| b / MIB).into()),
+        ("shared_mib", sample.adapter_shared.get(&a.luid).map(|b| b / MIB).into()),
+        ("spilled", spills_json(&spills(a, sample, rows))),
         ("procs", Value::Arr(mine)),
     ])
+}
+
+pub fn spills_json(spills: &[(u32, u64)]) -> Value {
+    Value::Arr(spills.iter().map(|(pid, mib)| obj([("pid", (*pid).into()), ("shared_mib", (*mib).into())])).collect())
 }

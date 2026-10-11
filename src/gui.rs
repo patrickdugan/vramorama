@@ -164,7 +164,7 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
             }
         }
         let leases = crate::run::live_leases(&by_lease);
-        let outstanding = ledger::outstanding(&leases, &by_lease);
+        let outstanding = ledger::outstanding(&leases, &by_lease, crate::sys::filetime_to_unix(ft));
 
         let adapter_list: Vec<Value> = adapters
             .iter()
@@ -176,6 +176,7 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
                     ("luid", crate::parse::luid_string(a.luid).into()),
                     ("total_mib", total.into()),
                     ("used_mib", used.into()),
+                    ("spill_warning", crate::spill::warning(&crate::scan::spills(a, &sample, &rows)).into()),
                     ("available_mib", (ledger::available(total, used, outstanding, HEADROOM_MIB).max(0) as u64).into()),
                     ("procs", Value::Arr(procs_json.remove(&a.luid).unwrap_or_default())),
                 ])

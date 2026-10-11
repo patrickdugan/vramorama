@@ -75,22 +75,47 @@ fn pick_card(want: Option<&str>) -> Result<Card, String> {
     Ok(Card { luid: a.luid, name: a.name, total_mib: a.dedicated / MIB })
 }
 
-/// Memory in use on the card, and how much of it each lease's processes hold.
+/// Memory in use on the card, how much of it each lease's processes hold, how much processes
+/// started without a lease hold, and which processes have spilled into system memory.
 struct View {
     used_mib: u64,
     by_lease: HashMap<String, u64>,
+    unleased_mib: u64,
+    unleased_procs: usize,
+    spills: Vec<(u32, u64)>,
 }
 
 fn observe(sampler: &mut Sampler, scanner: &mut Scanner, card: &Card) -> View {
     let sample = sampler.sample();
     let table = procs::snapshot();
     let mut by_lease = HashMap::new();
-    for r in scanner.rows(&sample, &table, &[card.luid], 1) {
-        if let Some(id) = &r.owner.lease {
-            *by_lease.entry(id.clone()).or_insert(0) += r.mib;
+    let (mut unleased_mib, mut unleased_procs) = (0, 0);
+    let rows = scanner.rows(&sample, &table, &[card.luid], 1);
+    for r in &rows {
+        match &r.owner.lease {
+            Some(id) => *by_lease.entry(id.clone()).or_insert(0) += r.mib,
+            // Desktop programs hold a little everywhere; count what looks like a job.
+            None if r.mib >= 256 => {
+                unleased_mib += r.mib;
+                unleased_procs += 1;
+            }
+            None => {}
         }
     }
-    View { used_mib: sample.adapter_used.get(&card.luid).copied().unwrap_or(0) / MIB, by_lease }
+    let adapter = gpu::Adapter {
+        luid: card.luid,
+        name: card.name.clone(),
+        vendor: 0,
+        dedicated: card.total_mib * MIB,
+        software: false,
+    };
+    View {
+        used_mib: sample.adapter_used.get(&card.luid).copied().unwrap_or(0) / MIB,
+        by_lease,
+        unleased_mib,
+        unleased_procs,
+        spills: crate::scan::spills(&adapter, &sample, &rows),
+    }
 }
 
 /// The process is running and is the one recorded (not a recycled pid). Unknown counts as yes,
@@ -174,7 +199,8 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
     }
 
     let start = Instant::now();
-    let mut fits_since: Option<Instant> = None;
+    // When the request first fitted, and the committed memory (in use plus reservations) then.
+    let mut fits_since: Option<(Instant, u64)> = None;
     let mut last_note = String::new();
     loop {
         let view = observe(&mut sampler, &mut scanner, &card);
@@ -184,18 +210,38 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
             if !leases.iter().any(|l| l.id == me.id) {
                 ledger::write(&root, &me)?; // removed by hand; put the request back
             }
-            let outstanding = ledger::outstanding(&leases, &view.by_lease);
+            let outstanding = ledger::outstanding(&leases, &view.by_lease, unix_now());
             let avail = ledger::available(card.total_mib, view.used_mib, outstanding, o.headroom_mib);
-            if ledger::may_admit(&me, &leases, avail) {
-                let since = *fits_since.get_or_insert_with(Instant::now);
-                if since.elapsed().as_secs_f64() >= o.settle_secs {
+            let committed = view.used_mib + outstanding;
+            if !view.spills.is_empty() {
+                // The card is already over-committed: one more job only makes everything slower.
+                fits_since = None;
+                let mib: u64 = view.spills.iter().map(|(_, m)| m).sum();
+                Some(format!(
+                    "{} MiB has spilled into system memory (pid {}); not admitting anything until it clears",
+                    thousands(mib),
+                    view.spills.iter().map(|(p, _)| p.to_string()).collect::<Vec<_>>().join(", ")
+                ))
+            } else if ledger::may_admit(&me, &leases, avail) {
+                let (since, base) = *fits_since.get_or_insert_with(|| (Instant::now(), committed));
+                if ledger::still_growing(base, committed) {
+                    // Something is still allocating, most likely a job started without a lease.
+                    fits_since = Some((Instant::now(), committed));
+                    Some(format!(
+                        "memory in use is still growing (+{} MiB since it first fitted); waiting for it to settle",
+                        thousands(committed - base)
+                    ))
+                } else if since.elapsed().as_secs_f64() >= o.settle_secs {
                     me.state = State::Admitted;
                     me.admitted_at = Some(unix_now());
                     ledger::write(&root, &me)?;
                     None
                 } else {
+                    if committed < base {
+                        fits_since = Some((since, committed)); // memory freed: measure growth from here
+                    }
                     Some(format!(
-                        "{} MiB free; confirming it stays free for {}s",
+                        "{} MiB free; confirming it stays free and stops growing for {}s",
                         thousands(avail.max(0) as u64),
                         o.settle_secs
                     ))
@@ -360,7 +406,8 @@ pub fn leases(json_out: bool, adapter: Option<&str>, headroom_mib: u64) -> Resul
         let _l = lock(&root)?;
         prune(&root, &view.by_lease)
     };
-    let outstanding = ledger::outstanding(&leases, &view.by_lease);
+    let now = unix_now();
+    let outstanding = ledger::outstanding(&leases, &view.by_lease, now);
     let avail = ledger::available(card.total_mib, view.used_mib, outstanding, headroom_mib);
     if json_out {
         use crate::json::{Value, obj};
@@ -370,6 +417,7 @@ pub fn leases(json_out: bool, adapter: Option<&str>, headroom_mib: u64) -> Resul
                 let mut v = l.to_json();
                 if let Value::Obj(kv) = &mut v {
                     kv.push(("using_mib".into(), view.by_lease.get(&l.id).copied().unwrap_or(0).into()));
+                    kv.push(("reservation_lapsed".into(), ledger::reservation_lapsed(l, now).into()));
                 }
                 v
             })
@@ -381,6 +429,8 @@ pub fn leases(json_out: bool, adapter: Option<&str>, headroom_mib: u64) -> Resul
             ("reserved_mib", outstanding.into()),
             ("headroom_mib", headroom_mib.into()),
             ("available_mib", (avail.max(0) as u64).into()),
+            ("unleased_mib", view.unleased_mib.into()),
+            ("spilled", crate::scan::spills_json(&view.spills)),
             ("leases", Value::Arr(list)),
         ]);
         println!("{out}");
@@ -395,6 +445,16 @@ pub fn leases(json_out: bool, adapter: Option<&str>, headroom_mib: u64) -> Resul
         thousands(headroom_mib),
         thousands(avail.max(0) as u64)
     );
+    if view.unleased_procs > 0 {
+        println!(
+            "  {} MiB of that is held by {} process(es) not started through `vramorama run`: they are respected, but cannot be queued",
+            thousands(view.unleased_mib),
+            view.unleased_procs
+        );
+    }
+    if let Some(w) = crate::spill::warning(&view.spills) {
+        println!("  WARNING {w}");
+    }
     if leases.is_empty() {
         println!("  (no leases)");
         return Ok(());
@@ -404,9 +464,13 @@ pub fn leases(json_out: bool, adapter: Option<&str>, headroom_mib: u64) -> Resul
         "{:<9} {:<9} {:>9} {:>9} {:>8} {:>6}  {:<20} COMMAND",
         "LEASE", "STATE", "VRAM MiB", "USING", "PID", "AGE", "OWNER"
     );
-    let now = unix_now();
     for l in &leases {
-        let state = if l.state == State::Admitted { "admitted" } else { "waiting" };
+        let state = match l.state {
+            State::Waiting => "waiting",
+            // Past the grace period an admitted lease is charged only for what it holds.
+            State::Admitted if ledger::reservation_lapsed(l, now) => "holding",
+            State::Admitted => "admitted",
+        };
         let using = view.by_lease.get(&l.id).copied().unwrap_or(0);
         let age = (now - l.created).max(0.0) as u64;
         let line = format!(

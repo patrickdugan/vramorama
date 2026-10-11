@@ -101,6 +101,9 @@ pub struct ProcUsage {
     pub pid: u32,
     pub luid: u64,
     pub dedicated: u64,
+    /// Shared (system) memory the process has mapped for this adapter. On a discrete card a large
+    /// value while dedicated memory is full means its allocations spilled (see `spill.rs`).
+    pub shared: u64,
     /// Busiest engine, in percent, as Task Manager shows it. `None` before two collections.
     pub util: Option<f64>,
 }
@@ -109,6 +112,8 @@ pub struct Sample {
     pub procs: Vec<ProcUsage>,
     /// Dedicated memory in use per adapter, all processes and the kernel together.
     pub adapter_used: HashMap<u64, u64>,
+    /// Shared memory in use per adapter. Empty when the counter is unavailable.
+    pub adapter_shared: HashMap<u64, u64>,
 }
 
 type PdhOpenQueryW = unsafe extern "system" fn(*const u16, usize, *mut isize) -> u32;
@@ -135,6 +140,9 @@ pub struct Sampler {
     proc_mem: isize,
     engine: isize,
     adapter_mem: isize,
+    /// The shared-memory counters are optional: without them spill cannot be seen, but nothing else changes.
+    proc_shared: Option<isize>,
+    adapter_shared: Option<isize>,
     collect: PdhCollectQueryData,
     get_array: PdhGetFormattedCounterArrayW,
     close: PdhCloseQuery,
@@ -170,7 +178,20 @@ impl Sampler {
             let proc_mem = counter(r"\GPU Process Memory(*)\Dedicated Usage")?;
             let engine = counter(r"\GPU Engine(*)\Utilization Percentage")?;
             let adapter_mem = counter(r"\GPU Adapter Memory(*)\Dedicated Usage")?;
-            Ok(Sampler { query, proc_mem, engine, adapter_mem, collect, get_array, close, collections: 0 })
+            let proc_shared = counter(r"\GPU Process Memory(*)\Shared Usage").ok();
+            let adapter_shared = counter(r"\GPU Adapter Memory(*)\Shared Usage").ok();
+            Ok(Sampler {
+                query,
+                proc_mem,
+                engine,
+                adapter_mem,
+                proc_shared,
+                adapter_shared,
+                collect,
+                get_array,
+                close,
+                collections: 0,
+            })
         }
     }
 
@@ -185,8 +206,19 @@ impl Sampler {
         let mut by_key: HashMap<(u32, u64), ProcUsage> = HashMap::new();
         for (name, raw) in self.read(self.proc_mem, PDH_FMT_LARGE) {
             if let Some((Some(pid), luid)) = parse_instance(&name) {
-                let e = by_key.entry((pid, luid)).or_insert(ProcUsage { pid, luid, dedicated: 0, util: None });
+                let e =
+                    by_key.entry((pid, luid)).or_insert(ProcUsage { pid, luid, dedicated: 0, shared: 0, util: None });
                 e.dedicated += raw.max(0) as u64;
+            }
+        }
+        if let Some(c) = self.proc_shared {
+            for (name, raw) in self.read(c, PDH_FMT_LARGE) {
+                if let Some((Some(pid), luid)) = parse_instance(&name) {
+                    // Only processes that also hold dedicated memory are listed.
+                    if let Some(e) = by_key.get_mut(&(pid, luid)) {
+                        e.shared += raw.max(0) as u64;
+                    }
+                }
             }
         }
         if self.collections >= 2 {
@@ -208,7 +240,15 @@ impl Sampler {
                 *adapter_used.entry(luid).or_insert(0) += raw.max(0) as u64;
             }
         }
-        Sample { procs: by_key.into_values().collect(), adapter_used }
+        let mut adapter_shared = HashMap::new();
+        if let Some(c) = self.adapter_shared {
+            for (name, raw) in self.read(c, PDH_FMT_LARGE) {
+                if let Some((None, luid)) = parse_instance(&name) {
+                    *adapter_shared.entry(luid).or_insert(0) += raw.max(0) as u64;
+                }
+            }
+        }
+        Sample { procs: by_key.into_values().collect(), adapter_used, adapter_shared }
     }
 
     /// (instance name, raw 64-bit value) for every instance with valid data.

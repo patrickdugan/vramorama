@@ -96,15 +96,37 @@ pub fn parse_size_mib(s: &str) -> Result<u64, String> {
     Ok(mib as u64)
 }
 
+/// How long after admission a lease's unallocated remainder stays reserved: long enough for a job
+/// to start and load its model. After that a lease is charged only for what its processes hold,
+/// so a queue runner that leased memory and then sat empty, or a job that asked for more than it
+/// uses, does not keep memory from everyone else indefinitely.
+pub const RESERVE_GRACE_SECS: f64 = 600.0;
+
+/// Whether `l`'s reservation has lapsed at unix time `now` (see `RESERVE_GRACE_SECS`).
+pub fn reservation_lapsed(l: &Lease, now: f64) -> bool {
+    l.state == State::Admitted && l.admitted_at.is_some_and(|t| now - t > RESERVE_GRACE_SECS)
+}
+
 /// Memory admitted leases have reserved but their processes have not allocated yet (a model
 /// still loading). Counting it is what stops a second job starting on memory the first is about
-/// to take.
-pub fn outstanding(leases: &[Lease], usage: &HashMap<String, u64>) -> u64 {
+/// to take. Lapsed reservations count nothing.
+pub fn outstanding(leases: &[Lease], usage: &HashMap<String, u64>, now: f64) -> u64 {
     leases
         .iter()
-        .filter(|l| l.state == State::Admitted)
+        .filter(|l| l.state == State::Admitted && !reservation_lapsed(l, now))
         .map(|l| l.vram_mib.saturating_sub(usage.get(&l.id).copied().unwrap_or(0)))
         .sum()
+}
+
+/// Growth in committed memory (in use plus outstanding reservations) during the settle period
+/// that restarts it. Leased jobs filling their reservations do not change the committed total;
+/// a job started without `vramorama run` loading its model does, and admitting on top of it is
+/// how two jobs end up on memory only one of them can have.
+pub const SETTLE_GROWTH_MIB: u64 = 256;
+
+/// Whether committed memory has grown enough since `base` to restart the settle period.
+pub fn still_growing(base: u64, committed: u64) -> bool {
+    committed > base + SETTLE_GROWTH_MIB
 }
 
 /// MiB a new admission may take: card total minus what is in use (by anyone, leased or not),
@@ -233,11 +255,37 @@ mod tests {
         let w = lease("w", State::Waiting, 4000, 3.0);
         let usage = HashMap::from([("a".to_string(), 6000u64), ("b".to_string(), 2500u64)]);
         // a has 3000 still to come; b is over its reservation (counts 0 outstanding, its real use is in `used`).
-        assert_eq!(outstanding(&[a.clone(), b.clone(), w.clone()], &usage), 3000);
+        assert_eq!(outstanding(&[a.clone(), b.clone(), w.clone()], &usage, 0.0), 3000);
         // 16000 total, 8500 in use, 3000 outstanding, 512 headroom.
         assert_eq!(available(16000, 8500, 3000, 512), 3988);
         assert!(!may_admit(&w, &[a.clone(), b.clone(), w.clone()], 3988));
         assert!(may_admit(&w, &[a, b, w.clone()], 4000));
+    }
+
+    #[test]
+    fn reservations_lapse_after_the_grace_period() {
+        // The phantom of 2026-10-11: a queue runner admitted for 3 GiB, holding nothing for 25 hours.
+        let mut q = lease("q", State::Admitted, 3072, 0.0);
+        q.admitted_at = Some(1000.0);
+        let mut loading = lease("l", State::Admitted, 9216, 0.0);
+        loading.admitted_at = Some(1000.0 + 25.0 * 3600.0 - 60.0);
+        let usage = HashMap::from([("l".to_string(), 2000u64)]);
+        let now = 1000.0 + 25.0 * 3600.0;
+        assert!(reservation_lapsed(&q, now));
+        assert!(!reservation_lapsed(&loading, now));
+        assert_eq!(outstanding(&[q.clone(), loading.clone()], &usage, now), 9216 - 2000);
+        // Within the grace period the queue runner's reservation still counts.
+        assert_eq!(outstanding(&[q.clone()], &usage, 1000.0 + RESERVE_GRACE_SECS - 1.0), 3072);
+        // A waiting request is never lapsed: it has not been admitted.
+        assert!(!reservation_lapsed(&lease("w", State::Waiting, 100, 0.0), now));
+    }
+
+    #[test]
+    fn settle_restarts_while_committed_memory_grows() {
+        assert!(!still_growing(6000, 6000));
+        assert!(!still_growing(6000, 6000 + SETTLE_GROWTH_MIB));
+        assert!(still_growing(6000, 6000 + SETTLE_GROWTH_MIB + 1));
+        assert!(!still_growing(6000, 5000), "memory being freed does not delay admission");
     }
 
     #[test]

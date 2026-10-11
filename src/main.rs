@@ -10,6 +10,7 @@ mod ledger;
 mod owner;
 mod parse;
 mod report;
+mod spill;
 mod transcripts;
 
 #[cfg(windows)]
@@ -68,7 +69,7 @@ OPTIONS
   --wide        do not truncate to the console width
   --trace       run `trace` for every untagged process
   --headroom    MiB left free for the desktop and drivers when admitting (default 512)
-  --settle      seconds the memory must stay free before admission (default 5)
+  --settle      seconds the memory must stay free, and stop growing, before admission (default 15)
 
 OWNERSHIP
   A process is tagged by environment variables it inherited:
@@ -229,7 +230,7 @@ fn os_run(args: &[String]) -> Result<i32, String> {
         detach: false,
         out: None,
         wait_secs: None,
-        settle_secs: 5.0,
+        settle_secs: 15.0,
         headroom_mib: 512,
         adapter: None,
         quiet: false,

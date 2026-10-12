@@ -163,7 +163,31 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 .gate { max-width: 560px; margin: 15vh auto; padding: 0 16px; }
 .gate h1 { font-size: 20px; }
 .stale-data { opacity: 0.55; transition: opacity 0.3s; }
-@media (forced-colors: active) { .sw, .bar > div, .minibar i { forced-color-adjust: none; } }
+.dot.idle { background: var(--muted); }
+
+/* agent apps and sessions */
+.apps { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.app { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--surface-2); min-width: 0; }
+.app .n { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 600; }
+.app .v { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.app .v small { font-size: 12px; font-weight: 400; color: var(--ink-2); margin-left: 4px; }
+.app .s { color: var(--muted); font-size: 12px; }
+.app .s + .s { margin-top: 4px; }
+.pill { display: inline-block; font-size: 11px; padding: 0 7px; border-radius: 9px; background: var(--surface-2); border: 1px solid var(--border); color: var(--ink-2); line-height: 17px; white-space: nowrap; vertical-align: 1px; }
+.sess { display: flex; align-items: center; gap: 9px; min-width: 240px; max-width: 440px; }
+.sess > div { min-width: 0; }
+.sess .id, .owner .id { color: var(--muted); font-size: 12px; }
+button.link { border: 0; background: none; padding: 0; margin: 0; font: inherit; font-weight: 500; color: var(--ink); cursor: pointer; text-align: left; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+button.link:hover { text-decoration: underline; }
+.trow { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.trow > button.link, .trow > span.name { flex: 0 1 auto; min-width: 0; }
+.trow > .pill, .trow > .badge { flex: none; }
+tr.sel td { background: var(--wash); }
+.jobs { display: flex; flex-wrap: wrap; gap: 4px; max-width: 320px; }
+.job { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 11px; border: 1px solid var(--border); border-radius: 6px; padding: 0 6px; color: var(--ink-2); white-space: nowrap; max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
+.filterbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: -4px 0 12px; font-size: 13px; color: var(--ink-2); }
+.owner > div { min-width: 0; }
+@media (forced-colors: active) { .sw, .bar > div, .minibar i, .dot { forced-color-adjust: none; } }
 </style>
 </head>
 <body>
@@ -213,18 +237,36 @@ async function copy(text, what) {
   try { await navigator.clipboard.writeText(text); toast("Copied: " + what); }
   catch (e) { window.prompt("Copy this command:", text); }
 }
+/** Same rule as vramorama's: Codex thread ids are UUIDv7, whose head is a timestamp, so use the tail. */
+const shortId = id => (id && id.length === 36 && id[8] === "-" && id[14] === "7") ? id.slice(28) : (id || "").slice(0, 8);
+const APP_SHORT = { "Claude Code": "Claude Code", "Claude Cowork": "Cowork", "ChatGPT (Codex)": "ChatGPT", "Codex CLI": "Codex CLI" };
+const pill = app => app ? el("span", { class: "pill", title: app, text: APP_SHORT[app] || app }) : null;
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 
-// ---------- owner colors: fixed slot order, assigned on first sight, never by rank ----------
+// ---------- colors: fixed slot order, assigned on first sight, freed when a group leaves ----------
+// One set of slots per grouping, so switching between them does not reshuffle colors.
 const SLOTS = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7"];
-const slotOf = new Map(JSON.parse(store("vramorama.slots") || "[]"));
+const slotMaps = {};
+function slotOf() {
+  return slotMaps[group] || (slotMaps[group] = new Map(JSON.parse(store("vramorama.slots." + group) || "[]")));
+}
+const saveSlots = () => store("vramorama.slots." + group, JSON.stringify([...slotOf()]));
+let inUse = new Set();
+function releaseSlots() {
+  const m = slotOf();
+  let changed = false;
+  for (const k of [...m.keys()]) if (!inUse.has(k)) { m.delete(k); changed = true; }
+  if (changed) saveSlots();
+}
 function colorOf(key) {
-  if (!slotOf.has(key)) {
-    const used = new Set(slotOf.values());
-    const free = SLOTS.findIndex((_, i) => !used.has(i));
-    slotOf.set(key, free);
-    store("vramorama.slots", JSON.stringify([...slotOf]));
+  if (!inUse.has(key)) return "var(--other)"; // history only: do not take a slot from a live group
+  const m = slotOf();
+  if (!m.has(key)) {
+    const used = new Set(m.values());
+    m.set(key, SLOTS.findIndex((_, i) => !used.has(i)));
+    saveSlots();
   }
-  const i = slotOf.get(key);
+  const i = m.get(key);
   return i >= 0 ? `var(${SLOTS[i]})` : "var(--other)";
 }
 
@@ -232,7 +274,21 @@ function colorOf(key) {
 const token = new URLSearchParams(location.hash.slice(1)).get("t");
 let now = null, points = [], since = 0, lastOk = 0, failing = false;
 let range = Number(store("vramorama.range") || 900);
-let hoverTs = null;
+// How memory is grouped: by the agent session that started it, or by job (label / lease / session).
+let group = store("vramorama.group") === "job" ? "job" : "session";
+// Processes table filter: { by: "session" | "job", key }.
+let filter = null;
+
+const keyOf = p => group === "session" ? p.group_key : p.owner_key;
+const groupList = () => (group === "session" ? now.sessions : now.owners) || [];
+const info = key => groupList().find(g => g.key === key);
+const sessionInfo = key => (now.sessions || []).find(g => g.key === key);
+function nameOf(key) {
+  const g = info(key);
+  if (!g) return key;
+  return group === "session" ? (g.title || g.label) : g.label;
+}
+const pointMap = p => (group === "session" ? p.s : p.o) || {};
 
 async function api(path) {
   const r = await fetch(path, { headers: { "X-Vramorama-Token": token || "" }, cache: "no-store" });
@@ -271,20 +327,25 @@ function gate(msg) {
 function render() {
   const app = document.getElementById("app");
   if (!now) { app.replaceChildren(el("div", { class: "gate" }, el("p", { class: "note", text: "Taking the first sample…" }))); return; }
-  // Re-rendering replaces the DOM; wait while a control has keyboard focus so it is not lost.
-  const focused = document.activeElement;
-  if (focused && focused !== document.body && app.contains(focused) && focused.matches("button")) {
-    if (!render.waiting) { render.waiting = true; focused.addEventListener("blur", () => { render.waiting = false; render(); }, { once: true }); }
-    return;
-  }
+  // Re-rendering replaces the DOM; controls carry data-fk so keyboard focus can be put back.
+  const active = document.activeElement;
+  const fk = active && app.contains(active) && active.dataset ? active.dataset.fk : null;
+  // Groups on the card now or on the visible timeline keep their colors; the rest free theirs.
+  inUse = new Set();
+  for (const a of now.adapters) for (const p of a.procs) inUse.add(keyOf(p));
+  for (const p of points) if (p.ts >= now.ts - range) for (const k of Object.keys(pointMap(p))) inUse.add(k);
+  releaseSlots();
+  if (filter && !now.adapters.some(a => a.procs.some(p => (filter.by === "session" ? p.group_key : p.owner_key) === filter.key))) filter = null;
   app.replaceChildren(
     header(),
     ...now.adapters.map(adapterCard),
+    sessionsCard(),
     timelineCard(),
     procsCard(),
-    el("div", { class: "grid2" }, ownersCard(), leasesCard()),
+    el("div", { class: "grid2" }, watermarkCard(), leasesCard()),
     el("footer", {}, `vramorama ${now.version || ""} · read-only: it shows who holds the GPU and never stops a process · served on 127.0.0.1`)
   );
+  if (fk) { const n = app.querySelector(`[data-fk="${CSS.escape(fk)}"]`); if (n) n.focus({ preventScroll: true }); }
   renderStatus();
 }
 
@@ -300,48 +361,54 @@ setInterval(renderStatus, 1000);
 
 function header() {
   const theme = store("vramorama.theme");
-  const rangeBtn = (secs, label) => el("button", { type: "button", "aria-pressed": String(range === secs), onclick: () => { range = secs; store("vramorama.range", String(secs)); render(); } }, label);
+  const rangeBtn = (secs, label) => el("button", { type: "button", "data-fk": "range-" + secs, "aria-pressed": String(range === secs), onclick: () => { range = secs; store("vramorama.range", String(secs)); render(); } }, label);
+  const groupBtn = (g, label, title) => el("button", { type: "button", "data-fk": "group-" + g, title, "aria-pressed": String(group === g), onclick: () => { group = g; store("vramorama.group", g); render(); } }, label);
   return el("header", { class: "top" },
     el("div", { class: "brand" }, el("b", { text: "vramorama" }), el("span", { text: "who is holding the GPU" })),
     el("span", { class: "live", id: "status" }),
+    el("div", { class: "seg", role: "group", "aria-label": "Group memory by" },
+      groupBtn("session", "By session", "Each agent session (Claude Code, Cowork, ChatGPT, Codex), with its labelled jobs inside it"),
+      groupBtn("job", "By job", "Each job label or lease, else the session")),
     el("div", { class: "seg", role: "group", "aria-label": "Timeline range" }, rangeBtn(300, "5 min"), rangeBtn(900, "15 min"), rangeBtn(3600, "1 hour")),
-    el("button", { class: "iconbtn", type: "button", title: "Switch light / dark", onclick: () => {
+    el("button", { class: "iconbtn", type: "button", "data-fk": "theme", title: "Switch light / dark", onclick: () => {
       const dark = getComputedStyle(document.documentElement).colorScheme === "dark";
-      document.documentElement.dataset.theme = dark ? "light" : "dark"; store("vramorama.theme", document.documentElement.dataset.theme);
+      document.documentElement.dataset.theme = dark ? "light" : "dark"; store("vramorama.theme", document.documentElement.dataset.theme); render();
     } }, theme === "dark" ? "Light" : theme === "light" ? "Dark" : "Theme"));
 }
 
-/** Owners on one adapter, largest first, with their combined memory. */
-function ownersOn(a) {
+/** Groups on one adapter, largest first, with their combined memory. */
+function groupsOn(a) {
   const m = new Map();
   for (const p of a.procs) {
-    const o = m.get(p.owner_key) || { key: p.owner_key, label: p.owner_label, mib: 0 };
-    o.mib += p.mib; m.set(p.owner_key, o);
+    const k = keyOf(p);
+    const o = m.get(k) || { key: k, label: nameOf(k), mib: 0 };
+    o.mib += p.mib; m.set(k, o);
   }
   return [...m.values()].sort((x, y) => y.mib - x.mib);
 }
 
 function adapterCard(a) {
-  const owners = ownersOn(a);
+  const owners = groupsOn(a);
   const listed = owners.reduce((s, o) => s + o.mib, 0);
   const elsewhere = Math.max(0, a.used_mib - listed);
   const total = Math.max(a.total_mib, a.used_mib, 1);
   const stale = a.procs.filter(p => p.verdict === "stale");
   const idle = a.procs.filter(p => p.verdict !== "active");
   const tip = el("div", { class: "tip", hidden: true });
-  const seg = (cls, color, mib, label) => {
+  const seg = (cls, color, mib, label, sub) => {
     const d = el("div", { class: cls, style: `flex: 0 0 ${(mib / total) * 100}%;` + (color ? `background:${color}` : "") });
     d.addEventListener("mousemove", ev => {
       tip.hidden = false;
       tip.replaceChildren(el("div", { class: "row" }, color ? el("span", { class: "sw", style: `background:${color}` }) : null, el("span", { class: "l", text: label }), el("span", { class: "n", text: fmt(mib) + " MiB" })),
-        el("div", { class: "t", text: `${((mib / total) * 100).toFixed(1)}% of the card` }));
+        el("div", { class: "t", text: (sub ? sub + " · " : "") + `${((mib / total) * 100).toFixed(1)}% of the card` }));
       const r = d.parentElement.getBoundingClientRect();
       tip.style.left = Math.min(ev.clientX - r.left + 12, r.width - 200) + "px"; tip.style.top = "28px";
     });
     d.addEventListener("mouseleave", () => { tip.hidden = true; });
     return d;
   };
-  const segs = owners.map(o => seg("", colorOf(o.key), o.mib, o.label));
+  const subOf = k => { const g = group === "session" ? sessionInfo(k) : null; return g && g.app ? `${g.app} · ${g.label}` : null; };
+  const segs = owners.map(o => seg("", colorOf(o.key), o.mib, o.label, subOf(o.key)));
   if (elsewhere > 0) segs.push(seg("elsewhere", null, elsewhere, "Elsewhere (small processes, drivers, WSL)"));
   segs.push(el("div", { class: "free", title: `${fmt(total - a.used_mib)} MiB free` }));
   return el("section", { class: "card", "aria-label": a.name },
@@ -364,20 +431,77 @@ function tile(label, value, unit) {
   return el("div", { class: "tile" }, el("div", { class: "label", text: label }), el("div", { class: "value" }, fmt(value), el("small", { text: unit })));
 }
 
-// ---------- timeline: in use (wash) + one 2px line per owner, one axis in MiB ----------
+// ---------- agent sessions: which session holds how much, per app ----------
+function stateChip(live) {
+  if (live === true) return el("span", { class: "chip active", title: "The agent app that started it is still running" }, el("span", { class: "ic", text: "●" }), "Live");
+  if (live === false) return el("span", { class: "chip stale", title: "The agent app that started it has exited; its memory can likely be freed" }, el("span", { class: "ic", text: "▲" }), "Ended");
+  return el("span", { class: "note", title: "Not known (no agent harness to check)", text: "–" });
+}
+
+function toggleFilter(by, key) {
+  filter = filter && filter.by === by && filter.key === key ? null : { by, key };
+  render();
+  if (filter) document.getElementById("procs")?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function appTile(a) {
+  const what = a.harness == null
+    ? plural(a.sessions, "group", "groups") + ": labels, leases and untagged processes"
+    : plural(a.sessions, "session", "sessions") + " on the GPU" + (a.running === true ? " · running" : a.running === false ? " · not running" : "");
+  return el("div", { class: "app", title: a.note || null },
+    el("div", { class: "n" }, a.harness ? el("span", { class: "dot" + (a.running ? "" : " idle") }) : null, el("span", { class: "trunc", text: a.name })),
+    el("div", { class: "v" }, fmt(a.mib), el("small", { text: "MiB" })),
+    el("div", { class: "s", text: what }),
+    a.note && a.sessions === 0 ? el("div", { class: "s", text: a.note }) : null);
+}
+
+function sessionsCard() {
+  const card = el("section", { class: "card", "aria-label": "Agent sessions" },
+    el("div", { class: "card-head" }, el("h2", { text: "Agent sessions" }),
+      el("p", { class: "sub", text: "GPU memory each agent session holds now. Jobs with a label or a lease count against the session that started them. Click a session to see its processes." })));
+  const apps = now.apps || [];
+  if (apps.length) card.append(el("div", { class: "apps" }, apps.map(appTile)));
+  const live = (now.sessions || []).filter(s => s.now_mib > 0);
+  if (!live.length) { card.append(el("p", { class: "note", text: "No process holds GPU memory above the threshold." })); return card; }
+  const total = Math.max(1, now.adapters.reduce((s, a) => s + a.total_mib, 0));
+  const head = el("tr", {}, ["Session", "State", "VRAM MiB", "Peak", "GiB·h", "Idle GiB·h", "Jobs"].map((h, i) =>
+    el("th", { class: [2, 3, 4, 5].includes(i) ? "num" : "", scope: "col", text: h })));
+  const body = live.map(s => {
+    const color = group === "session" ? colorOf(s.key) : "var(--other)";
+    const sel = filter && filter.by === "session" && filter.key === s.key;
+    const n = (s.pids || []).length;
+    const sub = [s.title ? s.label : null, n ? plural(n, "process", "processes") : null].filter(Boolean).join(" · ");
+    return el("tr", { class: sel ? "sel" : null },
+      el("td", {}, el("div", { class: "sess" }, el("span", { class: "sw", style: `background:${color}` }),
+        el("div", {},
+          el("div", { class: "trow" },
+            el("button", { type: "button", class: "link", "data-fk": "sess-" + s.key, "aria-pressed": String(!!sel), title: sel ? "Show all processes" : "Show this session's processes", onclick: () => toggleFilter("session", s.key) }, s.title || s.label),
+            pill(s.app)),
+          sub ? el("div", { class: "id trunc", text: sub }) : null))),
+      el("td", {}, stateChip(s.live)),
+      el("td", { class: "num" }, fmt(s.now_mib), el("span", { class: "minibar", title: `${((s.now_mib / total) * 100).toFixed(0)}% of the card` }, el("i", { style: `width:${Math.min(100, (s.now_mib / total) * 100)}%;background:${color}` }))),
+      el("td", { class: "num", title: "at " + clock(s.peak_ts), text: fmt(s.peak_mib) }),
+      el("td", { class: "num", text: s.gib_hours.toFixed(2) }),
+      el("td", { class: "num", text: s.idle_gib_hours.toFixed(2) }),
+      el("td", {}, (s.jobs || []).length ? el("div", { class: "jobs" }, s.jobs.map(j => el("span", { class: "job", title: j, text: j }))) : el("span", { class: "note", text: "–" })));
+  });
+  card.append(el("div", { class: "tablewrap" }, el("table", {}, el("thead", {}, head), el("tbody", {}, body))));
+  return card;
+}
+
+// ---------- timeline: in use (wash) + one 2px line per group, one axis in MiB ----------
 function timelineCard() {
   const card = el("section", { class: "card" },
-    el("div", { class: "card-head" }, el("h2", { text: "VRAM by owner" }),
-      el("p", { class: "sub", text: `MiB over the last ${range >= 3600 ? "hour" : range / 60 + " minutes"} · shaded: all memory in use · lines: each owner · top of the axis: the card's capacity` })));
+    el("div", { class: "card-head" }, el("h2", { text: group === "session" ? "VRAM by agent session" : "VRAM by job" }),
+      el("p", { class: "sub", text: `MiB over the last ${range >= 3600 ? "hour" : range / 60 + " minutes"} · shaded: all memory in use · lines: each ${group === "session" ? "session" : "job"} · top of the axis: the card's capacity` })));
   const box = el("div", { class: "chart" });
   card.append(box);
   const t1 = now.ts, t0 = t1 - range;
   const pts = points.filter(p => p.ts >= t0);
   if (pts.length < 2) { box.append(el("div", { class: "empty", text: "Collecting samples… the timeline fills in as vramorama watches." })); return card; }
   const keys = [];
-  for (const p of pts) for (const k of Object.keys(p.o)) if (!keys.includes(k)) keys.push(k);
-  const labelOf = new Map();
-  for (const o of now.owners) labelOf.set(o.key, o.label);
+  for (const p of pts) for (const k of Object.keys(pointMap(p))) if (!keys.includes(k)) keys.push(k);
+  const labelOf = new Map(keys.map(k => [k, nameOf(k)]));
   drawTimeline(box, pts, keys, labelOf, t0, t1);
   card.append(el("div", { class: "legend" },
     el("span", { class: "item" }, el("span", { class: "sw", style: "background:var(--wash);outline:1px solid var(--axis)" }), "All memory in use"),
@@ -406,7 +530,7 @@ function drawTimeline(box, pts, keys, labelOf, t0, t1) {
   const top = cap;
   const x = ts => padL + ((ts - t0) / (t1 - t0)) * (W - padL - padR);
   const y = v => padT + (1 - v / top) * (H - padT - padB);
-  const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "img", "aria-label": "VRAM in use over time, per owner" });
+  const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "img", "aria-label": "VRAM in use over time, per group" });
   const axis = sv("g", { class: "axis" });
   for (let v = 0; v <= top; v += step) {
     axis.append(sv("line", { x1: padL, x2: W - padR, y1: y(v), y2: y(v), stroke: v === 0 ? "var(--axis)" : "var(--grid)", "stroke-width": 1 }));
@@ -422,22 +546,22 @@ function drawTimeline(box, pts, keys, labelOf, t0, t1) {
   for (const p of pts) area += `L${x(p.ts)},${y(p.used)}`;
   area += `L${x(pts[pts.length - 1].ts)},${y(0)}Z`;
   svg.append(sv("path", { d: area, fill: "var(--wash)" }));
-  // One line per owner; a missing sample breaks the line instead of drawing a fake drop.
+  // One line per group; a missing sample breaks the line instead of drawing a fake drop.
   const gap = (now.interval || 2) * 3;
   const ends = [];
   for (const k of keys) {
     let d = "", prev = null;
     for (const p of pts) {
-      const v = p.o[k];
+      const v = pointMap(p)[k];
       if (v == null) { prev = null; continue; }
       d += (prev && p.ts - prev <= gap ? "L" : "M") + x(p.ts) + "," + y(v);
       prev = p.ts;
     }
     svg.append(sv("path", { d, fill: "none", stroke: colorOf(k), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
-    const last = [...pts].reverse().find(p => p.o[k] != null);
-    if (last) ends.push({ k, ts: last.ts, v: last.o[k] });
+    const last = [...pts].reverse().find(p => pointMap(p)[k] != null);
+    if (last) ends.push({ k, ts: last.ts, v: pointMap(last)[k] });
   }
-  // Direct end labels for up to four owners, if they do not collide.
+  // Direct end labels for up to four groups, if they do not collide.
   if (keys.length <= 4) {
     const placed = [];
     for (const e of ends.sort((a, b) => b.v - a.v)) {
@@ -463,13 +587,14 @@ function drawTimeline(box, pts, keys, labelOf, t0, t1) {
     const ts = t0 + ((sx - padL) / (W - padL - padR)) * (t1 - t0);
     let best = pts[0];
     for (const p of pts) if (Math.abs(p.ts - ts) < Math.abs(best.ts - ts)) best = p;
+    const bm = pointMap(best);
     cross.setAttribute("x1", x(best.ts)); cross.setAttribute("x2", x(best.ts)); cross.setAttribute("visibility", "visible");
-    dots.replaceChildren(...keys.filter(k => best.o[k] != null).map(k => sv("circle", { cx: x(best.ts), cy: y(best.o[k]), r: 4, fill: colorOf(k), stroke: "var(--surface)", "stroke-width": 2 })));
+    dots.replaceChildren(...keys.filter(k => bm[k] != null).map(k => sv("circle", { cx: x(best.ts), cy: y(bm[k]), r: 4, fill: colorOf(k), stroke: "var(--surface)", "stroke-width": 2 })));
     dots.setAttribute("visibility", "visible");
-    const rows = keys.filter(k => best.o[k] != null).sort((a, b) => best.o[b] - best.o[a]);
+    const rows = keys.filter(k => bm[k] != null).sort((a, b) => bm[b] - bm[a]);
     tip.replaceChildren(el("div", { class: "t", text: clock(best.ts) }),
       el("div", { class: "row" }, el("span", { class: "sw", style: "background:var(--wash);outline:1px solid var(--axis)" }), el("span", { class: "l", text: "All in use" }), el("span", { class: "n", text: fmt(best.used) })),
-      rows.map(k => el("div", { class: "row" }, el("span", { class: "sw", style: `background:${colorOf(k)}` }), el("span", { class: "l", text: labelOf.get(k) || k }), el("span", { class: "n", text: fmt(best.o[k]) }))));
+      rows.map(k => el("div", { class: "row" }, el("span", { class: "sw", style: `background:${colorOf(k)}` }), el("span", { class: "l", text: labelOf.get(k) || k }), el("span", { class: "n", text: fmt(bm[k]) }))));
     tip.hidden = false;
     const px = x(best.ts) * (r.width / W);
     tip.style.left = (px + 14 + 220 > r.width ? px - 14 - tip.offsetWidth : px + 14) + "px";
@@ -483,30 +608,46 @@ function drawTimeline(box, pts, keys, labelOf, t0, t1) {
 }
 
 // ---------- processes: the table view of everything above ----------
+function ownerCell(p) {
+  const live = p.harness_live === true ? el("span", { class: "badge", text: "session live" }) : p.harness_live === false ? el("span", { class: "badge", text: "session ended" }) : null;
+  const name = p.app ? (p.title || p.group_label) : p.label ? p.label : p.owner_text;
+  const detail = [p.app && p.title ? p.group_label : null, p.app && p.label ? "job " + p.label : null, p.lease ? "lease " + p.lease : null].filter(Boolean).join(" · ");
+  return el("div", { class: "owner" }, el("span", { class: "sw", style: `background:${colorOf(keyOf(p))}` }),
+    el("div", {},
+      el("div", { class: "trow", title: p.owner_text }, el("span", { class: "name trunc", text: name }), pill(p.app), live),
+      detail ? el("div", { class: "id trunc", text: detail }) : null));
+}
+
 function procsCard() {
-  const rows = [];
+  let rows = [];
   for (const a of now.adapters) for (const p of a.procs) rows.push({ a, p });
+  const all = rows.length;
+  if (filter) rows = rows.filter(({ p }) => (filter.by === "session" ? p.group_key : p.owner_key) === filter.key);
   rows.sort((x, y) => y.p.mib - x.p.mib);
-  const card = el("section", { class: "card" },
+  const card = el("section", { class: "card", id: "procs" },
     el("div", { class: "card-head" }, el("h2", { text: "Processes holding GPU memory" }),
       el("p", { class: "sub", text: "Owner comes from tags the process inherited; untagged ones can be traced to the agent session that typed their command." })));
+  if (filter) {
+    const g = filter.by === "session" ? sessionInfo(filter.key) : (now.owners || []).find(o => o.key === filter.key);
+    card.append(el("div", { class: "filterbar" },
+      `Showing ${rows.length} of ${all}: `, el("b", { text: g ? (g.title || g.label) : filter.key }),
+      el("button", { type: "button", class: "iconbtn", "data-fk": "clear-filter", onclick: () => { filter = null; render(); } }, "Show all")));
+  }
   if (!rows.length) { card.append(el("p", { class: "note", text: "No process holds GPU memory above the threshold." })); return card; }
   const head = el("tr", {}, ["Owner", "PID", "VRAM MiB", "Peak", "GPU %", "Status", "Started", "Command", ""].map((h, i) =>
     el("th", { class: [1, 2, 3, 4].includes(i) ? "num" : "", scope: "col", text: h })));
   const body = rows.map(({ a, p }) => {
-    const color = colorOf(p.owner_key);
-    const live = p.harness_live === true ? el("span", { class: "badge", text: "session live" }) : p.harness_live === false ? el("span", { class: "badge", text: "session ended" }) : null;
+    const color = colorOf(keyOf(p));
     const status = p.verdict === "stale"
       ? el("span", { class: "chip stale", title: p.why }, el("span", { class: "ic", text: "▲" }), "Stale · idle " + dur(p.idle_secs))
       : p.verdict === "idle"
         ? el("span", { class: "chip idle", title: p.why || "Idle" }, el("span", { class: "ic", text: "◆" }), "Idle " + dur(p.idle_secs))
         : el("span", { class: "chip active" }, el("span", { class: "ic", text: "●" }), "Active");
     const actions = el("div", { class: "actions" });
-    if (!p.session && !p.label && !p.note) actions.append(el("button", { type: "button", onclick: () => openTrace(p.pid), title: "Search agent transcripts for the session that launched it" }, "Trace"));
-    if (p.verdict === "stale") actions.append(el("button", { type: "button", title: "vramorama never stops processes; this copies the command for you to run", onclick: () => copy(`Stop-Process -Id ${p.pid}`, `Stop-Process -Id ${p.pid}`) }, "Copy stop command"));
+    if (!p.session && !p.label && !p.note) actions.append(el("button", { type: "button", "data-fk": "trace-" + p.pid, onclick: () => openTrace(p.pid), title: "Search agent transcripts for the session that launched it" }, "Trace"));
+    if (p.verdict === "stale") actions.append(el("button", { type: "button", "data-fk": "stop-" + p.pid, title: "vramorama never stops processes; this copies the command for you to run", onclick: () => copy(`Stop-Process -Id ${p.pid}`, `Stop-Process -Id ${p.pid}`) }, "Copy stop command"));
     return el("tr", {},
-      el("td", {}, el("div", { class: "owner" }, el("span", { class: "sw", style: `background:${color}` }),
-        el("span", { class: "trunc" }, el("span", { class: "name", text: p.owner_label }), " ", live))),
+      el("td", {}, ownerCell(p)),
       el("td", { class: "num", text: p.pid }),
       el("td", { class: "num" }, fmt(p.mib), el("span", { class: "minibar", "aria-hidden": "true" }, el("i", { style: `width:${Math.min(100, (p.mib / Math.max(a.total_mib, 1)) * 100)}%;background:${color}` }))),
       el("td", { class: "num", text: fmt(p.peak_mib) }),
@@ -520,13 +661,19 @@ function procsCard() {
   return card;
 }
 
-function ownersCard() {
+function watermarkCard() {
+  const bySession = group === "session";
+  const list = groupList();
   const card = el("section", { class: "card" },
-    el("div", { class: "card-head" }, el("h2", { text: "Watermark by owner" }), el("p", { class: "sub", text: "since " + hhmm(now.started) })));
-  if (!now.owners.length) { card.append(el("p", { class: "note", text: "Nothing has held GPU memory yet." })); return card; }
-  const head = el("tr", {}, ["Owner", "Now", "Peak", "GiB·h", "Idle GiB·h"].map((h, i) => el("th", { class: i ? "num" : "", scope: "col", text: h })));
-  const body = now.owners.map(o => el("tr", {},
-    el("td", {}, el("div", { class: "owner", style: "min-width:160px" }, el("span", { class: "sw", style: `background:${colorOf(o.key)}` }), el("span", { class: "trunc", text: o.label }))),
+    el("div", { class: "card-head" }, el("h2", { text: bySession ? "Watermark by session" : "Watermark by job" }), el("p", { class: "sub", text: "since " + hhmm(now.started) })));
+  if (!list.length) { card.append(el("p", { class: "note", text: "Nothing has held GPU memory yet." })); return card; }
+  const head = el("tr", {}, [bySession ? "Session" : "Job", "Now", "Peak", "GiB·h", "Idle GiB·h"].map((h, i) => el("th", { class: i ? "num" : "", scope: "col", text: h })));
+  const body = list.map(o => el("tr", { class: filter && filter.key === o.key ? "sel" : null },
+    el("td", {}, el("div", { class: "owner", style: "min-width:160px" }, el("span", { class: "sw", style: `background:${colorOf(o.key)}` }),
+      el("div", { class: "trunc" },
+        o.now_mib ? el("button", { type: "button", class: "link", "data-fk": "wm-" + o.key, title: "Show its processes", onclick: () => toggleFilter(bySession ? "session" : "job", o.key) }, bySession ? (o.title || o.label) : o.label)
+          : el("span", { text: bySession ? (o.title || o.label) : o.label }),
+        bySession && o.app ? el("div", { class: "id trunc" }, o.title ? o.label + " · " : "", o.app) : null))),
     el("td", { class: "num", text: o.now_mib ? fmt(o.now_mib) : "–" }),
     el("td", { class: "num", title: "at " + clock(o.peak_ts), text: fmt(o.peak_mib) }),
     el("td", { class: "num", text: o.gib_hours.toFixed(2) }),
@@ -537,19 +684,29 @@ function ownersCard() {
 
 function leasesCard() {
   const card = el("section", { class: "card" },
-    el("div", { class: "card-head" }, el("h2", { text: "Leases" }), el("p", { class: "sub", text: "jobs started with vramorama run" })));
+    el("div", { class: "card-head" }, el("h2", { text: "Leases" }), el("p", { class: "sub", title: now.ledger || "", text: "jobs started with vramorama run" })));
+  const untracked = now.untracked_leases || [];
+  if (untracked.length) {
+    card.append(el("p", { class: "spill", style: "border-left-color:var(--warning);background:color-mix(in srgb, var(--warning) 12%, transparent);margin:0 0 12px" },
+      `${plural(untracked.length, "lease tag", "lease tags")} on running processes ${untracked.length === 1 ? "is" : "are"} not in this ledger (${untracked.map(u => `${u.id}: ${fmt(u.mib)} MiB`).join(", ")}). ` +
+      `They were queued by an older vramorama or in another ledger, so new leases do not queue behind them; their memory still counts as in use. Ledger: ${now.ledger || "unknown"}.`));
+  }
   if (!now.leases.length) {
     card.append(el("p", { class: "note" }, "No leases. Start GPU jobs with ", el("code", { text: "vramorama run --vram 9G -- <command>" }), " so they queue for memory instead of racing for it."));
     return card;
   }
-  const head = el("tr", {}, ["Lease", "State", "Reserved", "Using", "Owner", "Age"].map((h, i) => el("th", { class: [2, 3, 5].includes(i) ? "num" : "", scope: "col", text: h })));
-  const body = now.leases.map(l => el("tr", {},
-    el("td", { class: "mono", title: l.cmd, text: l.id }),
-    el("td", {}, el("span", { class: "chip " + (l.state === "admitted" ? "active" : "idle") }, el("span", { class: "ic", text: l.state === "admitted" ? "●" : "◆" }), l.state === "admitted" ? "Admitted" : "Waiting")),
-    el("td", { class: "num", text: fmt(l.vram_mib) }),
-    el("td", { class: "num", text: fmt(l.using_mib) }),
-    el("td", { class: "trunc", style: "max-width:160px", text: l.owner || "–" }),
-    el("td", { class: "num", text: dur(now.ts - l.created) })));
+  const head = el("tr", {}, ["Lease", "State", "Reserved", "Using", "Job", "Session", "Age"].map((h, i) => el("th", { class: [2, 3, 6].includes(i) ? "num" : "", scope: "col", text: h })));
+  const body = now.leases.map(l => {
+    const s = l.session ? sessionInfo(l.session) : null;
+    return el("tr", {},
+      el("td", { class: "mono", title: (l.legacy_ledger ? "In the ledger of vramorama 0.5 and earlier; honored until it finishes. " : "") + l.cmd, text: l.id + (l.legacy_ledger ? "*" : "") }),
+      el("td", {}, el("span", { class: "chip " + (l.state === "admitted" ? "active" : "idle") }, el("span", { class: "ic", text: l.state === "admitted" ? "●" : "◆" }), l.state === "admitted" ? "Admitted" : "Waiting")),
+      el("td", { class: "num", text: fmt(l.vram_mib) }),
+      el("td", { class: "num", text: fmt(l.using_mib) }),
+      el("td", { class: "trunc", style: "max-width:160px", title: l.owner || "", text: l.owner && l.owner !== l.session ? l.owner : "–" }),
+      el("td", { class: "trunc", style: "max-width:200px", title: l.session || "", text: (s && s.title) || l.session_title || (s ? s.label : l.session || "–") }),
+      el("td", { class: "num", text: dur(now.ts - l.created) }));
+  });
   card.append(el("div", { class: "tablewrap" }, el("table", {}, el("thead", {}, head), el("tbody", {}, body))));
   return card;
 }
@@ -571,7 +728,8 @@ async function openTrace(pid) {
     t.cwd ? [el("dt", { text: "Folder" }), el("dd", { text: t.cwd })] : null,
     t.cmd ? [el("dt", { text: "Command" }), el("dd", { class: "mono", style: "font-family:ui-monospace,Consolas,monospace;font-size:12px", text: t.cmd })] : null,
     el("dt", { text: "Launch chain" }), el("dd", { text: chain }),
-    t.session ? [el("dt", { text: "Tagged" }), el("dd", { text: `Claude Code session ${t.session}${t.title ? " “" + t.title + "”" : ""}` })] : null,
+    t.session ? [el("dt", { text: "Tagged" }), el("dd", { text: `${t.app || "agent"} session ${t.session}${t.title ? " “" + t.title + "”" : ""}` })] : null,
+    t.job ? [el("dt", { text: "Job" }), el("dd", { text: t.job })] : null,
     t.tagged_ancestors.length ? [el("dt", { text: "Tagged parent" }), el("dd", { text: t.tagged_ancestors.map(a => `${a.exe} ${a.pid}: ${a.owner}`).join(", ") })] : null,
     t.searched != null ? [el("dt", { text: "Searched" }), el("dd", { text: `${t.searched} transcripts modified since ${t.since ? clock(t.since) : "ever"}` })] : null);
   const out = [kv];
@@ -582,7 +740,7 @@ async function openTrace(pid) {
     if (t.hits[0].kind !== "launched") out.push(el("p", { class: "note", text: "No session typed this command before the process started; these only mention it. The launcher may have built it from variables." }));
     for (const h of t.hits) out.push(el("div", { class: "hit" },
       el("div", {}, el("span", { class: "chip " + (h.kind === "launched" ? "active" : "idle") }, el("span", { class: "ic", text: h.kind === "launched" ? "●" : "◆" }), h.kind === "launched" ? "Launched by" : "Mentioned by"),
-        " ", el("span", { class: "k", text: `${h.harness} session ${h.session.slice(0, 8)}` }), h.title ? " “" + h.title + "”" : "",
+        " ", el("span", { class: "k", text: `${h.harness} ${h.harness === "codex" ? "thread" : "session"} ${shortId(h.session)}` }), h.title ? " “" + h.title + "”" : "",
         h.kind === "launched" && h.lead_secs != null ? el("span", { class: "note", text: ` · tool call ${dur(h.lead_secs)} before the process started` }) : null),
       el("div", { class: "p", text: `${h.path}:${h.line}` }),
       el("div", { class: "p", text: `matched ${h.via_exe} ${h.via_pid}: ${h.needle}` })));

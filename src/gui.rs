@@ -37,8 +37,8 @@ pub struct GuiOpts {
     pub min_mib: u64,
 }
 
-/// Per-owner totals since the page's server started.
-struct OwnerStats {
+/// Totals per group (agent session, or job owner) since the page's server started.
+struct Stats {
     label: String,
     peak: u64,
     peak_ts: f64,
@@ -46,6 +46,81 @@ struct OwnerStats {
     last_ts: f64,
     gib_h: f64,
     idle_gib_h: f64,
+    /// What the group looked like when last seen (app, title, ...), kept after it leaves the card.
+    meta: Vec<(String, Value)>,
+}
+
+/// Stats for one way of grouping processes.
+#[derive(Default)]
+struct Tally {
+    stats: HashMap<String, Stats>,
+    now: HashMap<String, u64>,
+}
+
+impl Tally {
+    fn begin(&mut self) {
+        self.now.clear();
+    }
+
+    fn add(&mut self, key: &str, label: &str, mib: u64, idle: bool, ts: f64, dt: f64) {
+        *self.now.entry(key.to_string()).or_insert(0) += mib;
+        let s = self.stats.entry(key.to_string()).or_insert_with(|| Stats {
+            label: label.to_string(),
+            peak: 0,
+            peak_ts: ts,
+            first_ts: ts,
+            last_ts: ts,
+            gib_h: 0.0,
+            idle_gib_h: 0.0,
+            meta: Vec::new(),
+        });
+        s.label = label.to_string();
+        s.last_ts = ts;
+        s.gib_h += mib as f64 / 1024.0 * dt / 3600.0;
+        if idle {
+            s.idle_gib_h += mib as f64 / 1024.0 * dt / 3600.0;
+        }
+    }
+
+    fn end(&mut self, ts: f64) {
+        for (k, mib) in &self.now {
+            if let Some(s) = self.stats.get_mut(k) {
+                if *mib > s.peak {
+                    s.peak = *mib;
+                    s.peak_ts = ts;
+                }
+            }
+        }
+    }
+
+    /// Largest peak first.
+    fn json(&self) -> Vec<Value> {
+        let mut list: Vec<(&String, &Stats)> = self.stats.iter().collect();
+        list.sort_by_key(|(k, s)| {
+            (std::cmp::Reverse(self.now.get(*k).copied().unwrap_or(0)), std::cmp::Reverse(s.peak))
+        });
+        list.iter()
+            .map(|(k, s)| {
+                let mut kv: Vec<(String, Value)> = vec![
+                    ("key".into(), k.as_str().into()),
+                    ("label".into(), s.label.as_str().into()),
+                    ("now_mib".into(), self.now.get(*k).copied().unwrap_or(0).into()),
+                    ("peak_mib".into(), s.peak.into()),
+                    ("peak_ts".into(), s.peak_ts.into()),
+                    ("first_ts".into(), s.first_ts.into()),
+                    ("last_ts".into(), s.last_ts.into()),
+                    ("gib_hours".into(), s.gib_h.into()),
+                    ("idle_gib_hours".into(), s.idle_gib_h.into()),
+                ];
+                kv.extend(s.meta.iter().cloned());
+                Value::Obj(kv)
+            })
+            .collect()
+    }
+
+    fn point(&self) -> Value {
+        Value::Obj(self.now.iter().map(|(k, v)| (k.clone(), (*v).into())).collect())
+    }
 }
 
 #[derive(Default)]
@@ -91,7 +166,10 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
     let mut scanner = Scanner::default();
     let mut peaks: HashMap<(u32, u64), u64> = HashMap::new();
     let mut idle_since: HashMap<(u32, u64), f64> = HashMap::new();
-    let mut owners: HashMap<String, OwnerStats> = HashMap::new();
+    let mut owners = Tally::default();
+    let mut sessions = Tally::default();
+    // Tags of the session that asked for each lease, looked up once per lease.
+    let mut lease_owners: HashMap<String, Option<crate::owner::Owner>> = HashMap::new();
     let started = filetime_to_unix(now_filetime());
     let mut last_ts: Option<f64> = None;
     loop {
@@ -106,8 +184,9 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
         let dt = last_ts.map_or(interval, |l| (ts - l).min(3.0 * interval));
         last_ts = Some(ts);
 
-        // Per process: peak, idle streak, verdict. Per owner: totals.
-        let mut now_by_owner: HashMap<String, u64> = HashMap::new();
+        // Per process: peak, idle streak, verdict. Per owner and per agent session: totals.
+        owners.begin();
+        sessions.begin();
         let mut procs_json: HashMap<u64, Vec<Value>> = HashMap::new();
         for r in &rows {
             let key = (r.pid, r.luid);
@@ -129,32 +208,21 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
                 None => ("active", String::new()),
             };
             let (okey, olabel) = mark_key(r);
-            *now_by_owner.entry(okey.clone()).or_insert(0) += r.mib;
-            let s = owners.entry(okey.clone()).or_insert_with(|| OwnerStats {
-                label: olabel.clone(),
-                peak: 0,
-                peak_ts: ts,
-                first_ts: ts,
-                last_ts: ts,
-                gib_h: 0.0,
-                idle_gib_h: 0.0,
-            });
-            s.label = olabel.clone();
-            s.last_ts = ts;
-            s.gib_h += r.mib as f64 / 1024.0 * dt / 3600.0;
-            if idle {
-                s.idle_gib_h += r.mib as f64 / 1024.0 * dt / 3600.0;
-            }
+            let (skey, slabel) = r.session_group();
+            owners.add(&okey, &olabel, r.mib, idle, ts, dt);
+            sessions.add(&skey, &slabel, r.mib, idle, ts, dt);
             procs_json.entry(r.luid).or_default().push(proc_json(r, *peak, idle_secs, verdict, &why, okey, olabel));
         }
-        for (k, mib) in &now_by_owner {
-            if let Some(s) = owners.get_mut(k) {
-                if *mib > s.peak {
-                    s.peak = *mib;
-                    s.peak_ts = ts;
-                }
+        owners.end(ts);
+        sessions.end(ts);
+        let groups = crate::agents::group(&rows);
+        for g in &groups {
+            if let (Some(s), Value::Obj(kv)) = (sessions.stats.get_mut(&g.key), crate::agents::group_json(g)) {
+                // Everything but the running totals, which the tally keeps.
+                s.meta = kv.into_iter().filter(|(k, _)| !matches!(k.as_str(), "key" | "label" | "mib")).collect();
             }
         }
+        let apps: Vec<Value> = crate::agents::apps(&groups, &table).iter().map(crate::agents::app_json).collect();
 
         // Leases: memory per lease from the processes' tags; the ledger is only read here.
         let mut by_lease: HashMap<String, u64> = HashMap::new();
@@ -164,6 +232,7 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
             }
         }
         let leases = crate::run::live_leases(&by_lease);
+        let legacy: Vec<String> = crate::run::legacy_leases(&by_lease).into_iter().map(|l| l.id).collect();
         let outstanding = ledger::outstanding(&leases, &by_lease, crate::sys::filetime_to_unix(ft));
 
         let adapter_list: Vec<Value> = adapters
@@ -182,30 +251,26 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
                 ])
             })
             .collect();
-        let mut owner_list: Vec<(&String, &OwnerStats)> = owners.iter().collect();
-        owner_list.sort_by_key(|(_, s)| std::cmp::Reverse(s.peak));
-        let owner_json: Vec<Value> = owner_list
-            .iter()
-            .map(|(k, s)| {
-                obj([
-                    ("key", k.as_str().into()),
-                    ("label", s.label.as_str().into()),
-                    ("now_mib", now_by_owner.get(*k).copied().unwrap_or(0).into()),
-                    ("peak_mib", s.peak.into()),
-                    ("peak_ts", s.peak_ts.into()),
-                    ("first_ts", s.first_ts.into()),
-                    ("last_ts", s.last_ts.into()),
-                    ("gib_hours", s.gib_h.into()),
-                    ("idle_gib_hours", s.idle_gib_h.into()),
-                ])
-            })
-            .collect();
+        // Lease tags on running processes that this ledger has never heard of: jobs queued in a
+        // ledger somewhere else (an older vramorama, another VRAMORAMA_HOME).
+        let mut untracked: Vec<(&String, &u64)> =
+            by_lease.iter().filter(|(id, _)| !leases.iter().any(|l| &l.id == *id)).collect();
+        untracked.sort();
+        let untracked: Vec<Value> =
+            untracked.iter().map(|(id, mib)| obj([("id", id.as_str().into()), ("mib", (**mib).into())])).collect();
         let lease_json: Vec<Value> = leases
             .iter()
             .map(|l| {
                 let mut v = l.to_json();
                 if let Value::Obj(kv) = &mut v {
                     kv.push(("using_mib".into(), by_lease.get(&l.id).copied().unwrap_or(0).into()));
+                    kv.push(("legacy_ledger".into(), legacy.contains(&l.id).into()));
+                    let owner = lease_owners.entry(l.id.clone()).or_insert_with(|| crate::run::lease_owner(l)).clone();
+                    let session = l.session.clone().or_else(|| owner.as_ref().and_then(|o| o.agent_session_key()));
+                    if let Some((_, slot)) = kv.iter_mut().find(|(k, _)| k == "session") {
+                        *slot = session.into();
+                    }
+                    kv.push(("session_title".into(), owner.and_then(|o| scanner.titles.title(&o)).into()));
                 }
                 v
             })
@@ -221,14 +286,15 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
             ("headroom_mib", HEADROOM_MIB.into()),
             ("reserved_mib", outstanding.into()),
             ("adapters", Value::Arr(adapter_list)),
-            ("owners", Value::Arr(owner_json)),
+            ("owners", Value::Arr(owners.json())),
+            ("sessions", Value::Arr(sessions.json())),
+            ("apps", Value::Arr(apps)),
             ("leases", Value::Arr(lease_json)),
+            ("untracked_leases", Value::Arr(untracked)),
+            ("ledger", ledger::dir().map(|d| d.display().to_string()).into()),
         ]);
-        let point = obj([
-            ("ts", ts.into()),
-            ("used", used_total.into()),
-            ("o", Value::Obj(now_by_owner.into_iter().map(|(k, v)| (k, v.into())).collect())),
-        ]);
+        let point =
+            obj([("ts", ts.into()), ("used", used_total.into()), ("o", owners.point()), ("s", sessions.point())]);
         let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
         s.now = now.to_string();
         s.points.push_back((ts, point.to_string()));
@@ -249,12 +315,15 @@ fn proc_json(
 ) -> Value {
     let mut v = row_json(r);
     if let Value::Obj(kv) = &mut v {
+        let (skey, slabel) = r.session_group();
         kv.push(("peak_mib".into(), peak.into()));
         kv.push(("idle_secs".into(), idle_secs.into()));
         kv.push(("verdict".into(), verdict.into()));
         kv.push(("why".into(), why.into()));
         kv.push(("owner_key".into(), okey.into()));
         kv.push(("owner_label".into(), olabel.into()));
+        kv.push(("group_key".into(), skey.into()));
+        kv.push(("group_label".into(), slabel.into()));
         kv.push(("owner_text".into(), owner_text(r).into()));
         kv.push(("command_text".into(), command_text(r).into()));
     }
@@ -289,7 +358,9 @@ fn trace_json(t: &TraceInfo) -> Value {
         ("cmd", d.cmdline.clone().into()),
         ("note", d.note.into()),
         ("owner", t.owner.key().into()),
-        ("session", t.owner.session.clone().into()),
+        ("session", t.owner.session().map(str::to_string).into()),
+        ("app", t.owner.app().into()),
+        ("job", t.owner.label.clone().into()),
         ("title", t.title.clone().into()),
         ("transcript", t.transcript.as_ref().map(|p| p.display().to_string()).into()),
         (

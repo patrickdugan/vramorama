@@ -4,10 +4,10 @@ use std::collections::HashMap;
 
 use crate::gpu::{Adapter, Sample};
 use crate::json::{Value, obj};
-use crate::owner::Owner;
+use crate::owner::{Harness, Owner, short};
 use crate::parse::luid_string;
 use crate::procs::{self, Entry};
-use crate::transcripts;
+use crate::sessions::Titles;
 
 const MIB: u64 = 1 << 20;
 
@@ -24,12 +24,32 @@ pub struct Row {
     pub cmd: Option<String>,
     pub cwd: Option<String>,
     pub owner: Owner,
+    /// The agent session's title, as its app shows it.
     pub title: Option<String>,
-    /// Whether the Claude Code instance that launched the job is still running.
+    /// Whether the agent harness that launched the job (Claude Code, Codex) is still running.
     pub harness_live: Option<bool>,
     /// For untagged processes, where the launch chain starts (see `origin`).
     pub root: Option<String>,
     pub note: Option<&'static str>,
+}
+
+impl Row {
+    /// Agent-session group: key and short label (`claude 5f3c1e2a`), or the job's owner, or for
+    /// untagged processes the process itself.
+    pub fn session_group(&self) -> (String, String) {
+        if let (Some(k), Some(word), Some(id)) =
+            (self.owner.agent_session_key(), self.owner.app_word(), self.owner.session())
+        {
+            return (k, format!("{word} {}", short(id)));
+        }
+        match self.owner.session_key() {
+            Some(k) => (k.clone(), k),
+            None => {
+                let k = format!("untagged {} {}", self.name, self.pid);
+                (k.clone(), k)
+            }
+        }
+    }
 }
 
 /// What does not change while a process lives, cached by (pid, start time).
@@ -40,7 +60,6 @@ struct Fixed {
     cmd: Option<String>,
     cwd: Option<String>,
     owner: Owner,
-    title: Option<String>,
     root: Option<String>,
     note: Option<&'static str>,
 }
@@ -48,7 +67,7 @@ struct Fixed {
 #[derive(Default)]
 pub struct Scanner {
     cache: HashMap<(u32, Option<u64>), Fixed>,
-    titles: HashMap<String, Option<String>>,
+    pub titles: Titles,
 }
 
 impl Scanner {
@@ -68,6 +87,7 @@ impl Scanner {
                 }
             };
             let harness_live = fixed.owner.harness_pid.and_then(|hp| procs::alive(hp, fixed.started));
+            let title = self.titles.title(&fixed.owner);
             rows.push(Row {
                 pid: u.pid,
                 luid: u.luid,
@@ -79,7 +99,7 @@ impl Scanner {
                 cmd: fixed.cmd,
                 cwd: fixed.cwd,
                 owner: fixed.owner,
-                title: fixed.title,
+                title,
                 harness_live,
                 root: fixed.root,
                 note: fixed.note,
@@ -91,11 +111,10 @@ impl Scanner {
 
     fn fixed(&mut self, pid: u32, table: &HashMap<u32, Entry>) -> Fixed {
         let d = procs::details(pid);
-        let owner = d.env.as_deref().map(Owner::from_env).unwrap_or_default();
-        let title = owner
-            .session
-            .as_ref()
-            .and_then(|s| self.titles.entry(s.clone()).or_insert_with(|| transcripts::session_title(s)).clone());
+        let mut owner = d.env.as_deref().map(Owner::from_env).unwrap_or_default();
+        if owner.codex.is_some() {
+            resolve_harness(&mut owner, pid, table);
+        }
         let root = if owner.is_tagged() { None } else { origin(pid, table) };
         Fixed {
             name: table.get(&pid).map(|e| e.exe.clone()).unwrap_or_else(|| "?".into()),
@@ -103,9 +122,30 @@ impl Scanner {
             cmd: d.cmdline,
             cwd: d.cwd,
             owner,
-            title,
             root,
             note: d.note,
+        }
+    }
+}
+
+/// Fill in what a Codex tag leaves out, from the process tree: the `codex.exe` whose exit ends
+/// the thread (Codex exports no pid), whether the ChatGPT app runs it, and, when a Claude tag is
+/// present too, which of the two agents is nearer (the one that ran the command).
+pub fn resolve_harness(owner: &mut Owner, pid: u32, table: &HashMap<u32, Entry>) {
+    let (chain, _) = procs::ancestry(pid, table);
+    let exe = |p: &u32| table.get(p).map(|e| e.exe.to_ascii_lowercase()).unwrap_or_default();
+    let codex = chain.iter().position(|p| exe(p) == "codex.exe");
+    let claude = chain.iter().position(|p| owner.harness_pid == Some(*p) || exe(p) == "claude.exe");
+    owner.nearest = match (claude, codex) {
+        (Some(c), Some(x)) if c < x => Some(Harness::Claude),
+        (_, Some(_)) => Some(Harness::Codex),
+        (Some(_), None) => Some(Harness::Claude),
+        (None, None) => None,
+    };
+    if owner.harness() == Some(Harness::Codex) {
+        owner.harness_pid = codex.map(|i| chain[i]);
+        if let Some(i) = codex {
+            owner.codex_desktop |= chain[i + 1..].iter().any(|p| exe(p) == "chatgpt.exe");
         }
     }
 }
@@ -118,6 +158,7 @@ pub const HOSTS: &[&str] = &[
     "openconsole.exe",
     "conhost.exe",
     "claude.exe",
+    "chatgpt.exe",
     "code.exe",
     "codex.exe",
     "svchost.exe",
@@ -187,8 +228,13 @@ pub fn row_json(r: &Row) -> Value {
         ("name", r.name.as_str().into()),
         ("started", r.started.map(crate::sys::fmt_utc).into()),
         ("owner", r.owner.key().into()),
+        ("session_key", r.owner.session_key().into()),
         ("label", r.owner.label.clone().into()),
-        ("session", r.owner.session.clone().into()),
+        ("lease", r.owner.lease.clone().into()),
+        ("harness", r.owner.harness().map(|h| h.tag()).into()),
+        ("app", r.owner.app().into()),
+        ("session", r.owner.session().map(str::to_string).into()),
+        ("desktop_session", r.owner.claude_host.clone().into()),
         ("title", r.title.clone().into()),
         ("agent", r.owner.agent.clone().into()),
         ("harness_live", r.harness_live.into()),

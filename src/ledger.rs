@@ -24,6 +24,8 @@ pub struct Lease {
     pub vram_mib: u64,
     /// Owner key at request time (label, `claude:<id>`, or agent), for display.
     pub owner: Option<String>,
+    /// The agent session that asked (`claude:<id>`, `codex:<id>`), even when `owner` is a label.
+    pub session: Option<String>,
     pub cmd: String,
     pub cwd: Option<String>,
     /// The `vramorama run` process holding the request.
@@ -44,6 +46,7 @@ impl Lease {
             ("state", if self.state == State::Admitted { "admitted" } else { "waiting" }.into()),
             ("vram_mib", self.vram_mib.into()),
             ("owner", self.owner.clone().into()),
+            ("session", self.session.clone().into()),
             ("cmd", self.cmd.as_str().into()),
             ("cwd", self.cwd.clone().into()),
             ("runner_pid", self.runner_pid.into()),
@@ -66,6 +69,7 @@ impl Lease {
             },
             vram_mib: v.f64("vram_mib")? as u64,
             owner: v.str("owner").map(str::to_string),
+            session: v.str("session").map(str::to_string),
             cmd: v.str("cmd").unwrap_or_default().to_string(),
             cwd: v.str("cwd").map(str::to_string),
             runner_pid: v.f64("runner_pid")? as u32,
@@ -151,14 +155,32 @@ fn earlier(a: &Lease, b: &Lease) -> bool {
     (a.created, &a.id) < (b.created, &b.id)
 }
 
-/// `%LOCALAPPDATA%\vramorama`, or `VRAMORAMA_HOME` when set.
+/// `~/.vramorama` (`%USERPROFILE%\.vramorama`), or `VRAMORAMA_HOME` when set.
+///
+/// Not under `%LOCALAPPDATA%`: the Claude and ChatGPT desktop apps are MSIX packages, and Windows
+/// redirects files that processes inside a package create under `AppData` to that package's own
+/// folder (`%LOCALAPPDATA%\Packages\<package>\LocalCache`). Every agent app would then queue in a
+/// ledger of its own that the others cannot see (seen 2026-10-12: Claude sessions' leases were in
+/// the Claude package's folder, and `%LOCALAPPDATA%\vramorama` did not exist). The profile folder
+/// itself is not redirected, which is why `~/.claude` and `~/.codex` are shared by all of them.
 pub fn dir() -> Option<PathBuf> {
-    if let Some(h) = std::env::var_os("VRAMORAMA_HOME") {
-        return Some(PathBuf::from(h));
+    let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    dir_from(var("VRAMORAMA_HOME"), var("USERPROFILE"), var("HOME"))
+}
+
+fn dir_from(explicit: Option<PathBuf>, profile: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    explicit.or_else(|| profile.or(home).map(|h| h.join(".vramorama")))
+}
+
+/// Where vramorama 0.5 and earlier kept the ledger (`%LOCALAPPDATA%\vramorama`). Jobs those
+/// versions queued keep using it until they finish, so it is read too (never written): new
+/// requests queue behind its waiting leases and count its reservations. Not with `VRAMORAMA_HOME`.
+pub fn legacy_dir() -> Option<PathBuf> {
+    if std::env::var_os("VRAMORAMA_HOME").is_some_and(|v| !v.is_empty()) {
+        return None;
     }
-    std::env::var_os("LOCALAPPDATA")
-        .map(|d| PathBuf::from(d).join("vramorama"))
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".vramorama")))
+    let old = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("vramorama");
+    (Some(&old) != dir().as_ref() && old.join("leases").is_dir()).then_some(old)
 }
 
 pub fn leases_dir(root: &Path) -> PathBuf {
@@ -215,7 +237,8 @@ mod tests {
             id: id.into(),
             state,
             vram_mib: vram,
-            owner: Some("claude:5f3c1e2a".into()),
+            owner: Some("lr-sweep".into()),
+            session: Some("claude:5f3c1e2a".into()),
             cmd: r#"python.exe -u train.py --lr 1e-4 "a b""#.into(),
             cwd: None,
             runner_pid: 100,
@@ -298,6 +321,18 @@ mod tests {
         assert!(may_admit(&big, &all, 12000));
         assert_eq!(queue_position(&small, &all), 1);
         assert_eq!(queue_position(&big, &all), 0);
+    }
+
+    #[test]
+    fn ledger_lives_in_the_profile_folder() {
+        let p = |s: &str| Some(PathBuf::from(s));
+        assert_eq!(
+            dir_from(None, p(r"C:\Users\me"), p("/ignored")),
+            Some(PathBuf::from(r"C:\Users\me").join(".vramorama"))
+        );
+        assert_eq!(dir_from(p("/tmp/scratch"), p(r"C:\Users\me"), None), p("/tmp/scratch"));
+        assert_eq!(dir_from(None, None, p("/home/me")), Some(PathBuf::from("/home/me").join(".vramorama")));
+        assert_eq!(dir_from(None, None, None), None);
     }
 
     #[test]

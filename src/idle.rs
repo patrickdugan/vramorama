@@ -22,10 +22,11 @@ pub fn classify(owner: &Owner, harness_live: Option<bool>, root: Option<&str>) -
     if let Some(label) = &owner.label {
         return (Verdict::Idle, format!("labelled \"{label}\"; ask its owner"));
     }
-    if owner.session.is_some() {
+    if owner.session().is_some() {
+        let app = owner.app().unwrap_or("agent");
         return match harness_live {
-            Some(false) => (Verdict::Stale, "the Claude Code session that started it has ended".into()),
-            Some(true) => (Verdict::Idle, "its Claude Code session is still running".into()),
+            Some(false) => (Verdict::Stale, format!("the {app} session that started it has ended")),
+            Some(true) => (Verdict::Idle, format!("its {app} session is still running")),
             None => (Verdict::Idle, "cannot tell whether its session is still running".into()),
         };
     }
@@ -46,12 +47,22 @@ mod tests {
     use super::*;
 
     fn session() -> Owner {
-        Owner { session: Some("5f3c1e2a-7d41".into()), harness_pid: Some(41200), ..Default::default() }
+        Owner { claude: Some("5f3c1e2a-7d41".into()), harness_pid: Some(41200), ..Default::default() }
     }
 
     #[test]
     fn only_ended_sessions_are_stale() {
         assert_eq!(classify(&session(), Some(false), None).0, Verdict::Stale);
+        // A Codex thread whose codex.exe has exited, e.g. the ChatGPT app was closed.
+        let codex = Owner {
+            codex: Some("0190c3a1-7b2e-7c4d-9e8f-1a2b3c4d5e6f".into()),
+            codex_desktop: true,
+            harness_pid: Some(12788),
+            ..Default::default()
+        };
+        let (v, why) = classify(&codex, Some(false), None);
+        assert_eq!(v, Verdict::Stale);
+        assert!(why.contains("ChatGPT (Codex)"), "{why}");
         // A browser's GPU process whose launcher exited looks exactly like an orphaned job.
         let (v, why) = classify(&Owner::default(), None, Some("from Discord.exe 15568 (parent exited)"));
         assert_eq!(v, Verdict::Idle);
@@ -62,7 +73,7 @@ mod tests {
     fn anything_with_a_possible_owner_is_only_idle() {
         assert_eq!(classify(&session(), Some(true), None).0, Verdict::Idle);
         assert_eq!(classify(&session(), None, None).0, Verdict::Idle);
-        let labelled = Owner { label: Some("eval-server".into()), session: Some("x".into()), ..Default::default() };
+        let labelled = Owner { label: Some("eval-server".into()), claude: Some("x".into()), ..Default::default() };
         assert_eq!(classify(&labelled, Some(false), None).0, Verdict::Idle, "a label is a person's claim");
         let leased = Owner { lease: Some("ab12cd34".into()), ..Default::default() };
         assert_eq!(classify(&leased, None, None).0, Verdict::Idle);

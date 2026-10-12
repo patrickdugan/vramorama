@@ -1,12 +1,27 @@
 # vramorama
 
 **Who is holding my GPU?** Per-process VRAM on a single workstation, with the agent session that
-launched each process.
+launched each process: Claude Code, Claude Cowork, the ChatGPT desktop app's Codex agent, or the
+Codex CLI.
 
 When several coding agents (and you) share one GPU, the card fills up overnight and nobody can say
 what is on it. On Windows `nvidia-smi` cannot even tell you how much memory each process holds:
 under the WDDM driver model NVML reports it as `N/A`. vramorama reads the numbers Windows keeps for
-Task Manager, then works out *who* owns each process:
+Task Manager, then works out *who* owns each process, and how much each agent session holds:
+
+```text
+> vramorama sessions
+NVIDIA GeForce RTX 5080 Laptop GPU: 15,802 of 15,915 MiB in use
+
+SESSION                    APP              STATE   VRAM MiB  SHARE PROCS  TITLE / JOBS
+claude a91d07c4            Claude Code      live       9,479    60%     1  “Nightly eval queue” · lr-sweep #234228b0
+chatgpt 3c4d5e6f           ChatGPT (Codex)  live       6,317    40%     2  “Fine-tune the reranker”
+
+  Claude Code                  9,479 MiB in 1 session(s)
+  Claude Cowork                    0 MiB in 0 session(s) (running; no session holds GPU memory)
+                           Cowork sessions run in a virtual machine with no GPU access, so they hold no VRAM here.
+  ChatGPT (Codex)              6,317 MiB in 1 session(s)
+```
 
 ```text
 > vramorama
@@ -22,7 +37,7 @@ Untagged processes: `vramorama trace <PID>` searches agent transcripts for the s
 > vramorama trace 8352
 pid 8352 python.exe  started 10-08 12:26  in C:\Users\me\GitHub\bench
   command   "C:\...\python.exe" -u scripts/xbench.py j --arm J-u4 --seed 1
-  tagged    no (no VRAMORAMA_OWNER / CLAUDE_CODE_SESSION_ID / AI_AGENT in its environment)
+  tagged    no (no VRAMORAMA_OWNER / CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID / AI_AGENT in its environment)
   ancestry  python.exe 8352 <- python.exe 32132 <- python.exe 29884 <- python.exe 14160 <- cmd.exe 33612 <- [exited 22684]
   search    13 transcripts modified since 10-08 12:03
   launched  claude session 5f3c1e2a-7d41-4b8e-9a6c-1e2f3a4b5c6d “Model research with Qwen” (tool call 6s before the process started)
@@ -49,10 +64,11 @@ is required: no SDK headers, no import libraries beyond what Rust itself links.
 
 | Command | What it does |
 |---|---|
-| `vramorama gui` | A live page in your browser: memory by owner, an hour of history, every process with its owner and idle state, watermarks, leases, and one-click trace. See [The GUI](#the-gui). |
+| `vramorama gui` | A live page in your browser: memory by agent session and by app, an hour of history, every process with its session, job and idle state, watermarks, leases, and one-click trace. See [The GUI](#the-gui). |
 | `vramorama` / `vramorama ps` | Processes holding GPU memory now, with owner, start time, working folder and command. `--json`, `--all` (include integrated GPUs), `--min MIB` (default 16), `--wide`, `--trace` (trace every untagged process). |
+| `vramorama sessions` | GPU memory per agent session (its app, title, whether it is still running, its share of the card, its processes and labelled jobs), and per agent app. `--json` for agents and scripts. |
 | `vramorama watch` | Refreshes every `--interval` seconds (default 5) and keeps a **running watermark**: each process's peak and how long it has been idle, and each owner's current and peak total. `--log FILE` appends one JSON line per sample; `--quiet` only logs. |
-| `vramorama report FILE` | Summarises a watch log: GiB-hours (and how many of them were *idle*, held at under 1% GPU), peak, GPU% and time held per owner. Answers "what sat on the card all night?" Gaps (sleep, a stopped watcher) are capped so they do not count as use. `--json`. |
+| `vramorama report FILE` | Summarises a watch log: GiB-hours (and how many of them were *idle*, held at under 1% GPU), peak, GPU% and time held per owner, or with `--by session` per agent session. Answers "what sat on the card all night?" Gaps (sleep, a stopped watcher) are capped so they do not count as use. `--json`. |
 | `vramorama trace PID` | For an untagged process: its full launch chain, and the agent transcript that typed the command. |
 | `vramorama run --vram 9G -- CMD…` | Waits for a VRAM lease (first come, first served), then runs `CMD` tagged with it. `--detach [--out LOG]` starts it outside the session. See [Sharing the card](#sharing-the-card-vramorama-run). |
 | `vramorama leases` | The lease ledger, how much a new request could get right now, memory held by processes outside any lease, and any spill. `--json`. |
@@ -75,13 +91,18 @@ vramorama gui            # opens http://127.0.0.1:7787/#t=<token> in your browse
 vramorama gui --port 0 --no-open   # any free port; just print the link
 ```
 
-The page shows, for each GPU, memory in use as a bar split by owner (the agent session, label or
-untagged process holding it), what a new lease could get, and how much is held idle or stale; a
-timeline of each owner's memory over the last 5 minutes to an hour; every process with its owner,
-memory and peak, GPU %, idle time and verdict, start time and command; per-owner watermarks
-(peak, GiB-hours, idle GiB-hours); and the lease ledger. **Trace** on an untagged process runs
-`vramorama trace` and shows the launch chain and the session that launched it. A stale process
-gets **Copy stop command**; the page never stops anything itself.
+The page shows, for each GPU, memory in use as a bar split by agent session (titled as the
+session's app titles it), what a new lease could get, and how much is held idle or stale. Below
+that, **Agent sessions**: a tile per agent app on this machine (Claude Code, Claude Cowork, the
+ChatGPT app, the Codex CLI, and everything outside agent sessions) with what its sessions hold,
+and a row per session with its app, whether it is still running, its memory and share of the card,
+peak, GiB-hours, idle GiB-hours and the labelled jobs inside it. Click a session to filter the
+process table to it. Then a timeline of each session's memory over the last 5 minutes to an hour;
+every process with its session, job, memory and peak, GPU %, idle time and verdict, start time and
+command; per-session watermarks; and the lease ledger, with the session that asked for each lease.
+**By job** switches the bar, timeline and watermarks to group by job label instead.
+**Trace** on an untagged process runs `vramorama trace` and shows the launch chain and the session
+that launched it. A stale process gets **Copy stop command**; the page never stops anything itself.
 
 It is served by vramorama itself, with the standard library's TCP listener, and the page is
 embedded in the binary: no web framework, no scripts or fonts from the network. Access:
@@ -103,8 +124,10 @@ environment of each GPU process (from its PEB, as Process Explorer and psutil do
 
 | Variable | Set by | Shown as |
 |---|---|---|
-| `VRAMORAMA_OWNER` | you, a script, or an agent's instructions | the label, verbatim (takes priority) |
-| `CLAUDE_CODE_SESSION_ID` | Claude Code, in every shell it starts | `claude <first 8>`, `(live)`/`(ended)` from `CLAUDE_PID`, and the session's title from its transcript |
+| `VRAMORAMA_OWNER` | you, a script, or an agent's instructions | the job's label; the memory still counts against the session that started it |
+| `CLAUDE_CODE_SESSION_ID` | Claude Code, in every shell it starts | `claude <first 8>`, `(live)`/`(ended)` from `CLAUDE_PID`, and the session's title |
+| `CLAUDE_CODE_SESSION_ID` with `CLAUDE_CODE_ENTRYPOINT=local-agent` | Claude Cowork | `cowork <first 8>`, as above |
+| `CODEX_THREAD_ID` | Codex: the agent in the ChatGPT desktop app, and the Codex CLI, on every command it runs | `chatgpt <last 8>` or `codex <last 8>`, the thread's name, and `(live)`/`(ended)` from the `codex.exe` that ran it |
 | `AI_AGENT` | some agent harnesses | the value |
 
 Tag anything by hand:
@@ -113,6 +136,33 @@ Tag anything by hand:
 $env:VRAMORAMA_OWNER = "sweep-lr-1e-4"; python train.py
 ```
 
+### Agent apps
+
+- **Claude Code** (the CLI, the desktop app's Code tab, IDE extensions). The title is the one the
+  desktop app's sidebar shows (its session records in `claude-code-sessions`), else the one in the
+  transcript (`/rename`, or the automatic title).
+- **Claude Cowork.** Cowork normally runs its sessions inside a Hyper-V virtual machine, which has
+  no GPU, so those sessions hold no VRAM on the host and have nothing to attribute; vramorama
+  lists Cowork as running (its `cowork-svc.exe` service) with 0 MiB. Cowork sessions that run on
+  the host are attributed like Claude Code sessions, titled from `local-agent-mode-sessions`,
+  with their transcript under the session's `CLAUDE_CONFIG_DIR`.
+- **The ChatGPT desktop app** runs Codex: `ChatGPT.exe` starts `codex.exe app-server`, which runs
+  each command, by default inside its Windows sandbox as the `CodexSandboxOffline` or
+  `CodexSandboxOnline` user. The sandboxed command still carries the environment, including
+  `CODEX_THREAD_ID`, and vramorama reads it without elevation. A thread is *live* while that
+  `codex.exe` runs; closing the app ends it. Thread names come from `~/.codex/session_index.jsonl`.
+  Codex thread ids are UUIDv7, whose first digits are a timestamp shared by threads started in the
+  same minute, so vramorama shortens them to their last 8 digits.
+- **The Codex CLI**: the same, without the app.
+
+When one agent runs another (a Claude session that runs `codex exec`), the commands carry both
+tags, and vramorama attributes them to the agent nearer in the process tree.
+
+Both desktop apps are MSIX packages, and Windows redirects files a packaged app creates under
+`AppData` into its package folder (`%LOCALAPPDATA%\Packages\<package>\LocalCache`). vramorama looks
+for the Claude app's session records in both places, so titles show up whichever app or terminal
+vramorama runs from.
+
 ### Jobs that lose their tags
 
 Agents often detach long jobs so they outlive the session, and the usual trick on Windows is
@@ -120,8 +170,8 @@ Agents often detach long jobs so they outlive the session, and the usual trick o
 **fresh** environment, so every tag is gone, and the launcher's parent exits soon after.
 vramorama shows these as `untagged, via WmiPrvSE.exe …` (while the WMI host lives) or
 `untagged, from <process> (parent exited)`, and `trace` recovers the owner by searching agent
-transcripts (`~/.claude/projects`, `~/.codex/sessions`) for the job's command line, and its
-ancestors' command lines. When an agent built the command from variables, the full line never
+transcripts (`~/.claude/projects`, `~/.codex/sessions`, Cowork's `local-agent-mode-sessions`) for
+the job's command line, and its ancestors' command lines. When an agent built the command from variables, the full line never
 matches, so `trace` also searches for the script or module being run (`-File queue.ps1`,
 `-m package.module`, `train.py`). It reads only transcripts modified after the job started. A
 session is reported as `launched` only if the text appears in one of its tool calls timestamped
@@ -180,9 +230,18 @@ lease 234228b0 pid 42620 (started through WMI, outside this session)
   tries to leave the session's job object (`CREATE_BREAKAWAY_FROM_JOB`). Agent hosts often forbid
   that (Claude Code's shells do), and then it starts the job through WMI, like agents do by hand,
   but passing the whole environment so the session and lease tags survive. Output goes to `--out`.
-- **The ledger** is one JSON file per lease in `%LOCALAPPDATA%\vramorama\leases`, changed only
-  while holding `ledger.lock`, a file opened without sharing. Windows releases that lock when its
-  holder exits, even after a crash. Set `VRAMORAMA_HOME` to use another directory.
+- **The ledger** is one JSON file per lease in `~\.vramorama\leases` (`%USERPROFILE%`), changed
+  only while holding `ledger.lock`, a file opened without sharing. Windows releases that lock when
+  its holder exits, even after a crash. Set `VRAMORAMA_HOME` to use another directory. Each lease
+  records the agent session that asked for it, so `leases` and the GUI show whose job is queued.
+- **One queue for every app.** Up to 0.5 the ledger was in `%LOCALAPPDATA%\vramorama`. Inside the
+  Claude and ChatGPT desktop apps (MSIX packages) Windows redirects that folder into each app's
+  package folder, so each app's agents queued in a ledger the others could not see, and a terminal
+  had a third. The profile folder is not redirected (it is why `~/.claude` and `~/.codex` work for
+  everyone). Leases still in the old ledger are read, never written: new requests queue behind
+  its waiting leases and count its reservations, and `leases` marks them with `*`. Running
+  processes whose lease tag is in no ledger vramorama can see are reported, since that is what a
+  split queue looks like.
 
 ## Spill
 
@@ -229,7 +288,8 @@ A line for your agent instructions (`CLAUDE.md`, `AGENTS.md`):
 
 > Start GPU jobs with `vramorama run --vram <estimate> -- <command>` (add `--detach --out <log>` for
 > jobs that must outlive the session) instead of polling for free memory yourself. Run `vramorama`
-> to see what is on the card and who started it.
+> to see what is on the card and who started it, and `vramorama sessions` for how much each agent
+> session holds.
 
 ## Idle holders
 
@@ -237,7 +297,8 @@ A process is *idle* when its busiest GPU engine stays under 1% for the whole win
 judges each one:
 
 - **stale**: it carries an agent session tag, and that session has ended (the Claude Code
-  process named by `CLAUDE_PID` is gone). This is the only verdict that needs positive evidence.
+  process named by `CLAUDE_PID` is gone, or for Codex the `codex.exe` that ran it). This is the
+  only verdict that needs positive evidence.
 - **idle**: everything else. Something may still want it: a live session, a `VRAMORAMA_OWNER`
   label, a lease, or no tag at all. Untagged processes are never called stale. Their launch chain
   being cut proves nothing: every browser GPU helper started by a short-lived launcher looks

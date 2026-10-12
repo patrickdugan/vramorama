@@ -1,8 +1,9 @@
 //! Agent transcripts on disk: session titles, and finding which session typed a command line.
 //!
 //! Claude Code keeps one JSONL file per session at `~/.claude/projects/<project>/<session>.jsonl`,
-//! where `<session>` equals the `CLAUDE_CODE_SESSION_ID` its shells export. Codex keeps
-//! `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
+//! where `<session>` equals the `CLAUDE_CODE_SESSION_ID` its shells export (Cowork sessions that
+//! run on this PC use a per-session `CLAUDE_CONFIG_DIR` under the desktop app's
+//! `local-agent-mode-sessions`). Codex keeps `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
 
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -16,16 +17,29 @@ pub fn home() -> Option<PathBuf> {
 
 pub fn roots() -> Vec<(&'static str, PathBuf)> {
     let Some(h) = home() else { return Vec::new() };
-    vec![("claude", h.join(".claude").join("projects")), ("codex", h.join(".codex").join("sessions"))]
+    let mut out = vec![("claude", h.join(".claude").join("projects")), ("codex", h.join(".codex").join("sessions"))];
+    for dir in crate::sessions::claude_user_data_dirs() {
+        out.push(("cowork", dir.join("local-agent-mode-sessions")));
+    }
+    out
 }
 
-/// The transcript of a Claude Code session, if it is on this machine.
-pub fn claude_transcript(session: &str) -> Option<PathBuf> {
+/// The transcript of a Claude Code session, if it is on this machine: under the session's
+/// `CLAUDE_CONFIG_DIR` when it has one, else under `~/.claude`.
+pub fn claude_transcript(session: &str, config_dir: Option<&str>) -> Option<PathBuf> {
     if session.is_empty() || session.contains(['/', '\\', '.']) {
         return None;
     }
-    let projects = home()?.join(".claude").join("projects");
-    std::fs::read_dir(projects).ok()?.flatten().map(|d| d.path().join(format!("{session}.jsonl"))).find(|p| p.is_file())
+    let mut configs: Vec<PathBuf> =
+        config_dir.map(|c| crate::sessions::with_package_paths(Path::new(c))).unwrap_or_default();
+    configs.push(home()?.join(".claude"));
+    configs.iter().find_map(|c| {
+        std::fs::read_dir(c.join("projects"))
+            .ok()?
+            .flatten()
+            .map(|d| d.path().join(format!("{session}.jsonl")))
+            .find(|p| p.is_file())
+    })
 }
 
 /// The latest title recorded in a transcript (Claude Code writes `custom-title` records).
@@ -36,8 +50,8 @@ pub fn title_in(content: &str) -> Option<String> {
     })
 }
 
-pub fn session_title(session: &str) -> Option<String> {
-    let text = std::fs::read(claude_transcript(session)?).ok()?;
+pub fn session_title(session: &str, config_dir: Option<&str>) -> Option<String> {
+    let text = std::fs::read(claude_transcript(session, config_dir)?).ok()?;
     title_in(&String::from_utf8_lossy(&text))
 }
 
@@ -86,7 +100,17 @@ pub fn search(needles: &[Needle], since_unix: Option<f64>) -> (usize, Vec<Hit>) 
 }
 
 pub fn search_in(roots: &[(&'static str, PathBuf)], needles: &[Needle], since_unix: Option<f64>) -> (usize, Vec<Hit>) {
-    let escaped: Vec<(String, &Needle)> = needles.iter().map(|n| (escape(&n.text), n)).collect();
+    // Escaped once (a command in a JSON string), and twice (Codex's desktop agent writes commands
+    // inside a JavaScript string inside its JSON record).
+    let mut escaped: Vec<(String, &Needle)> = Vec::new();
+    for n in needles {
+        let once = escape(&n.text);
+        let twice = escape(&once);
+        if twice != once {
+            escaped.push((twice, n));
+        }
+        escaped.push((once, n));
+    }
     let mut files = Vec::new();
     for (harness, root) in roots {
         collect_jsonl(root, harness, since_unix, &mut files, 0);
@@ -122,9 +146,11 @@ pub fn search_in(roots: &[(&'static str, PathBuf)], needles: &[Needle], since_un
             }
         }
         if let Some((kind, lead, at, needle)) = best {
+            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             hits.push(Hit {
                 harness,
-                session: path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                // Codex names the file rollout-<time>-<thread id>; the thread id is the session.
+                session: crate::sessions::thread_from_rollout(&stem).map_or_else(|| stem.clone(), str::to_string),
                 path: path.clone(),
                 title: title_in(&text),
                 needle: needle.text.clone(),
@@ -150,10 +176,12 @@ fn line_around(text: &str, at: usize) -> &str {
     &text[start..end]
 }
 
-/// A transcript record of the agent calling a tool (Claude Code `tool_use`, Codex `function_call`)
-/// as opposed to a tool's output coming back.
+/// A transcript record of the agent calling a tool (Claude Code `tool_use`; Codex `function_call`,
+/// `custom_tool_call` or `local_shell_call`) as opposed to a tool's output coming back.
 fn is_tool_call(record: &str) -> bool {
-    (record.contains("\"type\":\"tool_use\"") || record.contains("\"type\":\"function_call\""))
+    ["tool_use", "function_call", "custom_tool_call", "local_shell_call"]
+        .iter()
+        .any(|t| record.contains(&format!("\"type\":\"{t}\"")))
         && !record.contains("\"type\":\"tool_result\"")
 }
 
@@ -228,8 +256,42 @@ mod tests {
     }
     #[test]
     fn rejects_path_like_session_ids() {
-        assert_eq!(claude_transcript("../../etc/passwd"), None);
-        assert_eq!(claude_transcript(""), None);
+        assert_eq!(claude_transcript("../../etc/passwd", None), None);
+        assert_eq!(claude_transcript("", None), None);
+    }
+
+    #[test]
+    fn config_dir_transcripts_and_codex_thread_ids() {
+        let dir = std::env::temp_dir().join(format!("vramorama-cfg-{}", std::process::id()));
+        let proj = dir.join("cfg").join("projects").join("-sessions-x");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("9a8b7c6d-1111.jsonl"), "{\"customTitle\":\"Offsite plan\"}\n").unwrap();
+        let cfg = dir.join("cfg").display().to_string();
+        assert_eq!(session_title("9a8b7c6d-1111", Some(&cfg)).as_deref(), Some("Offsite plan"));
+        let day = dir.join("codex").join("2026").join("10").join("12");
+        std::fs::create_dir_all(&day).unwrap();
+        let launch = r#"{"timestamp":"2026-10-12T14:07:00Z","type":"response_item","payload":{"type":"function_call","arguments":"{\"command\":\"python train.py --epochs 3\"}"}}"#;
+        std::fs::write(
+            day.join("rollout-2026-10-12T14-06-50-0190c3a1-7b2e-7c4d-9e8f-1a2b3c4d5e6f.jsonl"),
+            format!("{launch}\n"),
+        )
+        .unwrap();
+        let (_, hits) = search_in(&[("codex", dir.join("codex"))], &needle("python train.py --epochs 3", None), None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session, "0190c3a1-7b2e-7c4d-9e8f-1a2b3c4d5e6f");
+        assert_eq!(hits[0].kind, Kind::Launched);
+        // The ChatGPT app's agent: a command inside a JavaScript string inside the JSON record.
+        let js = r#"{"timestamp":"2026-10-12T14:08:00Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.exec_command({cmd:\"python -u C:\\\\work\\\\train.py --seed 4\"});"}}"#;
+        std::fs::write(
+            day.join("rollout-2026-10-12T14-07-59-01a12eb9-0000-7000-8000-0000000000aa.jsonl"),
+            format!("{js}\n"),
+        )
+        .unwrap();
+        let (_, hits) =
+            search_in(&[("codex", dir.join("codex"))], &needle(r"-u C:\work\train.py --seed 4", None), None);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(hits.len(), 1);
+        assert_eq!((hits[0].session.as_str(), hits[0].kind), ("01a12eb9-0000-7000-8000-0000000000aa", Kind::Launched));
     }
 
     #[test]

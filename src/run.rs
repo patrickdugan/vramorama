@@ -144,18 +144,53 @@ fn live(l: &Lease, by_lease: &HashMap<String, u64>) -> bool {
 
 /// The live leases, read without the lock and without changing the ledger (for display).
 pub fn live_leases(by_lease: &HashMap<String, u64>) -> Vec<Lease> {
-    ledger::dir()
-        .map(|root| ledger::read_all(&root).into_iter().filter(|l| live(l, by_lease)).collect())
+    let mine = ledger::dir().map(|root| ledger::read_all(&root).into_iter().filter(|l| live(l, by_lease)).collect());
+    with_legacy(mine.unwrap_or_default(), by_lease)
+}
+
+/// The tags of the agent session that asked for a lease, read from the `run` process or the job
+/// (both inherited the requester's environment).
+pub fn lease_owner(l: &Lease) -> Option<Owner> {
+    [Some((l.runner_pid, l.runner_started)), l.job_pid.map(|p| (p, l.job_started))].into_iter().flatten().find_map(
+        |(pid, started)| {
+            let d = procs::details(pid);
+            let o = d.env.as_deref().map(Owner::from_env)?;
+            ((started.is_none() || d.created == started) && o.session().is_some()).then_some(o)
+        },
+    )
+}
+
+/// The agent session that asked for a lease. Leases from before 0.6 do not record it.
+pub fn lease_session(l: &Lease) -> Option<String> {
+    l.session.clone().or_else(|| lease_owner(l).and_then(|o| o.agent_session_key()))
+}
+
+/// Live leases of the pre-0.6 ledger (see `ledger::legacy_dir`): read, never written or pruned.
+pub fn legacy_leases(by_lease: &HashMap<String, u64>) -> Vec<Lease> {
+    ledger::legacy_dir()
+        .map(|old| ledger::read_all(&old).into_iter().filter(|l| live(l, by_lease)).collect())
         .unwrap_or_default()
 }
 
-/// Drop dead leases from the ledger. Call with the lock held.
+/// `leases` plus the live leases of the pre-0.6 ledger, oldest first.
+fn with_legacy(mut leases: Vec<Lease>, by_lease: &HashMap<String, u64>) -> Vec<Lease> {
+    for l in legacy_leases(by_lease) {
+        if !leases.iter().any(|m| m.id == l.id) {
+            leases.push(l);
+        }
+    }
+    leases.sort_by(|a, b| a.created.total_cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
+    leases
+}
+
+/// Drop dead leases from the ledger, and add the live ones of the pre-0.6 ledger. Call with the
+/// lock held.
 fn prune(root: &Path, by_lease: &HashMap<String, u64>) -> Vec<Lease> {
     let (keep, dead): (Vec<Lease>, Vec<Lease>) = ledger::read_all(root).into_iter().partition(|l| live(l, by_lease));
     for l in dead {
         ledger::remove(root, &l.id);
     }
-    keep
+    with_legacy(keep, by_lease)
 }
 
 fn unix_now() -> f64 {
@@ -164,7 +199,8 @@ fn unix_now() -> f64 {
 
 /// Returns the job's exit code (attached), or 0 once a detached job has started.
 pub fn run(o: &RunOpts) -> Result<i32, String> {
-    let root = ledger::dir().ok_or("cannot find %LOCALAPPDATA% for the ledger")?;
+    let root =
+        ledger::dir().ok_or("cannot find your profile folder (USERPROFILE) for the ledger; set VRAMORAMA_HOME")?;
     let card = pick_card(o.adapter.as_deref())?;
     if o.vram_mib + o.headroom_mib > card.total_mib {
         return Err(format!(
@@ -176,12 +212,14 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
         ));
     }
     let env: Vec<(String, String)> = std::env::vars().collect();
+    let tags = Owner::from_env(&env);
     let me_pid = std::process::id();
     let mut me = Lease {
         id: ledger::new_id(),
         state: State::Waiting,
         vram_mib: o.vram_mib,
-        owner: o.owner.clone().or_else(|| Owner::from_env(&env).key()),
+        owner: o.owner.clone().or_else(|| tags.key()),
+        session: tags.agent_session_key(),
         cmd: join_args(&o.argv),
         cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
         runner_pid: me_pid,
@@ -398,7 +436,8 @@ fn wmi_launch(argv: &[String], out: Option<&str>, tags: &[(&str, String)]) -> Re
 
 /// `vramorama leases`: the ledger and what a new request could get right now.
 pub fn leases(json_out: bool, adapter: Option<&str>, headroom_mib: u64) -> Result<(), String> {
-    let root = ledger::dir().ok_or("cannot find %LOCALAPPDATA% for the ledger")?;
+    let root =
+        ledger::dir().ok_or("cannot find your profile folder (USERPROFILE) for the ledger; set VRAMORAMA_HOME")?;
     let card = pick_card(adapter)?;
     let mut sampler = Sampler::open()?;
     let view = observe(&mut sampler, &mut Scanner::default(), &card);
@@ -409,6 +448,7 @@ pub fn leases(json_out: bool, adapter: Option<&str>, headroom_mib: u64) -> Resul
     let now = unix_now();
     let outstanding = ledger::outstanding(&leases, &view.by_lease, now);
     let avail = ledger::available(card.total_mib, view.used_mib, outstanding, headroom_mib);
+    let legacy: Vec<String> = legacy_leases(&view.by_lease).into_iter().map(|l| l.id).collect();
     if json_out {
         use crate::json::{Value, obj};
         let list = leases
@@ -418,6 +458,7 @@ pub fn leases(json_out: bool, adapter: Option<&str>, headroom_mib: u64) -> Resul
                 if let Value::Obj(kv) = &mut v {
                     kv.push(("using_mib".into(), view.by_lease.get(&l.id).copied().unwrap_or(0).into()));
                     kv.push(("reservation_lapsed".into(), ledger::reservation_lapsed(l, now).into()));
+                    kv.push(("legacy_ledger".into(), legacy.contains(&l.id).into()));
                 }
                 v
             })
@@ -455,14 +496,32 @@ pub fn leases(json_out: bool, adapter: Option<&str>, headroom_mib: u64) -> Resul
     if let Some(w) = crate::spill::warning(&view.spills) {
         println!("  WARNING {w}");
     }
+    let mut untracked: Vec<(&String, &u64)> =
+        view.by_lease.iter().filter(|(id, _)| !leases.iter().any(|l| &l.id == *id)).collect();
+    untracked.sort();
+    if !untracked.is_empty() {
+        let list: Vec<String> = untracked.iter().map(|(id, mib)| format!("{id} ({} MiB)", thousands(**mib))).collect();
+        println!(
+            "  NOTE running processes carry lease tags this ledger ({}) does not have: {}. They were queued by an older\n  \
+             vramorama or in another ledger, so new leases do not queue behind them; their memory still counts as in use.",
+            root.display(),
+            list.join(", ")
+        );
+    }
+    if !legacy.is_empty() {
+        println!(
+            "  NOTE leases marked * are in the ledger of vramorama 0.5 and earlier ({}); they are honored until they finish",
+            ledger::legacy_dir().map(|d| d.display().to_string()).unwrap_or_default()
+        );
+    }
     if leases.is_empty() {
         println!("  (no leases)");
         return Ok(());
     }
     let width = crate::width();
     println!(
-        "{:<9} {:<9} {:>9} {:>9} {:>8} {:>6}  {:<20} COMMAND",
-        "LEASE", "STATE", "VRAM MiB", "USING", "PID", "AGE", "OWNER"
+        "{:<9} {:<9} {:>9} {:>9} {:>8} {:>6}  {:<20} {:<15} COMMAND",
+        "LEASE", "STATE", "VRAM MiB", "USING", "PID", "AGE", "OWNER", "SESSION"
     );
     for l in &leases {
         let state = match l.state {
@@ -474,14 +533,15 @@ pub fn leases(json_out: bool, adapter: Option<&str>, headroom_mib: u64) -> Resul
         let using = view.by_lease.get(&l.id).copied().unwrap_or(0);
         let age = (now - l.created).max(0.0) as u64;
         let line = format!(
-            "{:<9} {:<9} {:>9} {:>9} {:>8} {:>6}  {:<20} {}",
-            l.id,
+            "{:<9} {:<9} {:>9} {:>9} {:>8} {:>6}  {:<20} {:<15} {}",
+            if legacy.contains(&l.id) { format!("{}*", l.id) } else { l.id.clone() },
             state,
             thousands(l.vram_mib),
             thousands(using),
             l.job_pid.map_or("–".into(), |p| p.to_string()),
             if age < 3600 { format!("{}m", age / 60) } else { format!("{}h{:02}m", age / 3600, age / 60 % 60) },
             ellipsize(l.owner.as_deref().unwrap_or("–"), 20),
+            lease_session(l).as_deref().unwrap_or("–"),
             l.cmd
         );
         println!("{}", ellipsize(&line, width));

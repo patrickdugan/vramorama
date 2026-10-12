@@ -10,9 +10,12 @@ mod ledger;
 mod owner;
 mod parse;
 mod report;
+mod sessions;
 mod spill;
 mod transcripts;
 
+#[cfg(windows)]
+mod agents;
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
@@ -34,11 +37,15 @@ vramorama: who is holding my GPU?
 USAGE
   vramorama [ps] [--json] [--all] [--min MIB] [--wide] [--trace]
       Processes holding GPU memory now, with the agent session that launched each one.
+  vramorama sessions [--json] [--all] [--min MIB] [--wide]
+      GPU memory per agent session (Claude Code, Claude Cowork, the ChatGPT app's Codex,
+      the Codex CLI) and per app. Labelled jobs count against the session that started them.
   vramorama watch [--interval SECS] [--log FILE] [--quiet] [--all] [--min MIB]
       Refresh every SECS (default 5), keeping each process's and each owner's peak
       (the running watermark). --log appends one JSON line per sample.
-  vramorama report FILE [--json]
-      Summarise a watch log: GiB-hours, peak and time held per owner.
+  vramorama report FILE [--json] [--by owner|session]
+      Summarise a watch log: GiB-hours, peak and time held per owner (job label, or session),
+      or with --by session per agent session.
   vramorama trace PID
       Find the agent transcript whose session launched PID (for untagged processes).
   vramorama run --vram SIZE [--owner NAME] [--detach [--out FILE]] [--wait SECS]
@@ -55,9 +62,9 @@ USAGE
       Processes that held memory but did no GPU work for SECS (default 20). Stale means
       the agent session that started it has ended; untagged processes are never stale.
   vramorama gui [--port N] [--no-open] [--interval SECS] [--all] [--min MIB]
-      A live page in your browser: memory by owner, an hour of history, processes,
-      idle and stale holders, leases, and trace. Served on 127.0.0.1 (default port
-      7787; 0 picks a free one) with an access token; read-only.
+      A live page in your browser: memory by agent session and by app, an hour of
+      history, processes, idle and stale holders, leases, and trace. Served on 127.0.0.1
+      (default port 7787; 0 picks a free one) with an access token; read-only.
   vramorama reclaim [PID...] [--force] [--window SECS]
       Re-check idle holders (all stale ones if no PID is given) and print the command
       that would free their memory. vramorama never stops a process itself.
@@ -73,11 +80,18 @@ OPTIONS
 
 OWNERSHIP
   A process is tagged by environment variables it inherited:
-    VRAMORAMA_OWNER          any label you choose (wins over the rest)
-    CLAUDE_CODE_SESSION_ID   set by Claude Code in every shell it starts
+    VRAMORAMA_OWNER          any label you choose (names the job)
+    CLAUDE_CODE_SESSION_ID   set by Claude Code in every shell it starts; Claude Cowork
+                             sessions also set CLAUDE_CODE_ENTRYPOINT=local-agent
+    CODEX_THREAD_ID          set by Codex (the ChatGPT app's agent, the Codex CLI) on
+                             every command it runs
     AI_AGENT                 set by some agent harnesses
   Jobs launched through WMI (Invoke-CimMethod Win32_Process) or Task Scheduler start
   with a clean environment and lose these tags; `trace` searches transcripts instead.
+
+FILES
+  The lease ledger is in ~/.vramorama (VRAMORAMA_HOME overrides it): outside AppData,
+  which Windows redirects per app for the Claude and ChatGPT desktop apps.
 ";
 
 #[derive(Default)]
@@ -97,6 +111,7 @@ pub struct Opts {
     pub min_given: bool,
     pub port: Option<u16>,
     pub no_open: bool,
+    pub by_session: bool,
     pub positional: Vec<String>,
 }
 
@@ -132,6 +147,13 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 }
             }
             "--log" => o.log = Some(value("--log")?),
+            "--by" => {
+                o.by_session = match value("--by")?.as_str() {
+                    "session" => true,
+                    "owner" | "job" => false,
+                    other => return Err(format!("--by takes owner or session, not {other}")),
+                }
+            }
             "--adapter" => o.adapter = Some(value("--adapter")?),
             "--headroom" => o.headroom_mib = value("--headroom")?.parse().map_err(|_| "--headroom takes MiB")?,
             s if s.starts_with('-') => return Err(format!("unknown option {s}; see --help")),
@@ -173,7 +195,7 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
             let o = parse_opts(rest)?;
             let [path] = o.positional.as_slice() else { return Err("usage: vramorama report FILE".into()) };
             let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-            let r = report::summarise(&text);
+            let r = report::summarise(&text, o.by_session);
             if o.json {
                 println!("{}", report::to_json(&r));
             } else {
@@ -182,7 +204,9 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         "run" => os_run(rest),
-        "ps" | "watch" | "trace" | "leases" | "idle" | "gui" => os_command(cmd, parse_opts(rest)?).map(|()| 0),
+        "ps" | "sessions" | "watch" | "trace" | "leases" | "idle" | "gui" => {
+            os_command(cmd, parse_opts(rest)?).map(|()| 0)
+        }
         "reclaim" => os_reclaim(parse_opts(rest)?),
         other => Err(format!("unknown command {other}; see --help")),
     }
@@ -192,6 +216,7 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
 fn os_command(cmd: &str, o: Opts) -> Result<(), String> {
     match cmd {
         "ps" => app::ps(&o),
+        "sessions" => app::sessions(&o),
         "watch" => app::watch(&o),
         "leases" => run::leases(o.json, o.adapter.as_deref(), o.headroom_mib),
         "gui" => gui::gui(gui::GuiOpts {

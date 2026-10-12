@@ -8,10 +8,11 @@ use crate::Opts;
 use crate::gpu::{self, Adapter, Sample, Sampler};
 use crate::idle::{IDLE_UTIL, Verdict, classify};
 use crate::json::{Value, obj};
-use crate::owner::{Owner, short};
+use crate::owner::{Harness, Owner};
 use crate::parse::{args_tail, basename, duration, ellipsize, needles, thousands};
 use crate::procs;
 use crate::scan::{Row, Scanner, adapter_json, is_host, pick_adapters};
+use crate::sessions::{self, Titles};
 use crate::sys::{filetime_to_unix, fmt_short, fmt_utc, now_filetime, unix_to_filetime};
 use crate::transcripts::{self, Kind, Needle};
 
@@ -118,8 +119,9 @@ struct Mark {
 pub fn mark_key(r: &Row) -> (String, String) {
     match r.owner.key() {
         Some(k) => {
-            let label = match (&r.owner.session, &r.title) {
-                (Some(_), Some(t)) if r.owner.label.is_none() => format!("{k} “{t}”"),
+            let label = match (r.owner.session(), &r.title) {
+                (Some(_), Some(t)) if r.owner.label.is_none() => format!("{} “{t}”", r.session_group().1),
+                (Some(_), None) if r.owner.label.is_none() => r.session_group().1,
                 _ => k.clone(),
             };
             (k, label)
@@ -170,20 +172,30 @@ fn render_marks(marks: &HashMap<String, Mark>, width: usize) -> String {
     out
 }
 
+/// The agent session in a few words: `claude 5f3c1e2a (live) “Night queue”`.
+pub fn session_text(r: &Row) -> Option<String> {
+    r.owner.session()?;
+    let state = match r.harness_live {
+        Some(true) => " (live)",
+        Some(false) => " (ended)",
+        None => "",
+    };
+    let title = r.title.as_deref().map(|t| format!(" “{t}”")).unwrap_or_default();
+    Some(format!("{}{state}{title}", r.session_group().1))
+}
+
 pub fn owner_text(r: &Row) -> String {
     let o: &Owner = &r.owner;
     let lease = o.lease.as_deref().map(|l| format!(" #{l}")).unwrap_or_default();
     if let Some(l) = &o.label {
-        return format!("{l}{lease}");
-    }
-    if let Some(s) = &o.session {
-        let state = match r.harness_live {
-            Some(true) => " (live)",
-            Some(false) => " (ended)",
-            None => "",
+        // The label names the job; the session says who started it.
+        return match session_text(r) {
+            Some(s) => format!("{l}{lease} · {s}"),
+            None => format!("{l}{lease}"),
         };
-        let title = r.title.as_deref().map(|t| format!(" “{t}”")).unwrap_or_default();
-        return format!("claude {}{state}{lease}{title}", short(s));
+    }
+    if let Some(s) = session_text(r) {
+        return format!("{s}{lease}");
     }
     if let Some(a) = &o.agent {
         return format!("{a}{lease}");
@@ -304,13 +316,17 @@ pub fn trace_info(pid: u32) -> Result<TraceInfo, String> {
     let table = procs::snapshot();
     let entry = table.get(&pid).ok_or(format!("no process {pid}"))?;
     let d = procs::details(pid);
-    let owner = d.env.as_deref().map(Owner::from_env).unwrap_or_default();
+    let mut owner = d.env.as_deref().map(Owner::from_env).unwrap_or_default();
+    if owner.codex.is_some() {
+        crate::scan::resolve_harness(&mut owner, pid, &table);
+    }
     let (chain, exited) = procs::ancestry(pid, &table);
+    let mut titles = Titles::default();
     let mut info = TraceInfo {
         pid,
         exe: entry.exe.clone(),
-        title: owner.session.as_deref().and_then(transcripts::session_title),
-        transcript: owner.session.as_deref().and_then(transcripts::claude_transcript),
+        title: titles.title(&owner),
+        transcript: session_transcript(&owner),
         owner,
         chain: std::iter::once(pid).chain(chain.iter().copied()).map(|p| (table[&p].exe.clone(), p)).collect(),
         exited,
@@ -319,7 +335,7 @@ pub fn trace_info(pid: u32) -> Result<TraceInfo, String> {
         hits: Vec::new(),
         details: d,
     };
-    if info.owner.session.is_some() {
+    if info.owner.session().is_some() {
         return Ok(info);
     }
     // Each candidate command line, with the process that ran it and when that process started.
@@ -354,7 +370,11 @@ pub fn trace_info(pid: u32) -> Result<TraceInfo, String> {
     info.search = Some((scanned, since_unix));
     info.hits = hits
         .into_iter()
-        .map(|h| {
+        .map(|mut h| {
+            // The app's own name for the session beats a title found in the transcript.
+            if let Some(t) = titles.for_hit(h.harness, &h.session) {
+                h.title = Some(t);
+            }
             let via = wanted.iter().find(|(_, n)| n.text == h.needle).map_or(pid, |(p, _)| *p);
             let via_exe = table.get(&via).map_or_else(|| "?".into(), |e| e.exe.clone());
             (h, via, via_exe)
@@ -378,11 +398,12 @@ pub fn trace(pid: u32) -> Result<(), String> {
     if let Some(note) = d.note {
         println!("  note      {note}");
     }
-    if let Some(s) = &t.owner.session {
-        println!(
-            "  tagged    Claude Code session {s}{}",
-            t.title.as_ref().map(|t| format!(" “{t}”")).unwrap_or_default()
-        );
+    if let (Some(s), Some(app)) = (t.owner.session(), t.owner.app()) {
+        let what = if t.owner.harness() == Some(Harness::Codex) { "thread" } else { "session" };
+        println!("  tagged    {app} {what} {s}{}", t.title.as_ref().map(|t| format!(" “{t}”")).unwrap_or_default());
+        if let Some(l) = &t.owner.label {
+            println!("  job       {l}");
+        }
         if let Some(p) = &t.transcript {
             println!("  transcript {}", p.display());
         }
@@ -392,7 +413,7 @@ pub fn trace(pid: u32) -> Result<(), String> {
         println!("  tagged    {l}");
     } else {
         println!(
-            "  tagged    no (no {} / CLAUDE_CODE_SESSION_ID / AI_AGENT in its environment)",
+            "  tagged    no (no {} / CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID / AI_AGENT in its environment)",
             crate::owner::LABEL_VAR
         );
     }
@@ -424,14 +445,105 @@ pub fn trace(pid: u32) -> Result<(), String> {
             _ => String::new(),
         };
         println!(
-            "  {:<9} {} session {}{}{lead}",
+            "  {:<9} {} {} {}{}{lead}",
             if h.kind == Kind::Launched { "launched" } else { "mentioned" },
             h.harness,
+            if h.harness == "codex" { "thread" } else { "session" },
             h.session,
             h.title.as_deref().map(|t| format!(" “{t}”")).unwrap_or_default()
         );
         println!("            {}:{}", h.path.display(), h.line);
         println!("            via {via_exe} {via}: {}", h.needle);
+    }
+    Ok(())
+}
+
+/// Where the session that started a process keeps its transcript.
+fn session_transcript(o: &Owner) -> Option<std::path::PathBuf> {
+    match o.harness()? {
+        Harness::Codex => sessions::codex_rollout(o.codex.as_deref()?, o.codex_home.as_deref()),
+        Harness::Claude | Harness::Cowork => {
+            transcripts::claude_transcript(o.claude.as_deref()?, o.claude_config.as_deref())
+        }
+    }
+}
+
+/// `vramorama sessions`: GPU memory per agent session (Claude Code, Cowork, the ChatGPT app's
+/// Codex, the Codex CLI), and per app.
+pub fn sessions(o: &Opts) -> Result<(), String> {
+    let mut sampler = Sampler::open()?;
+    sampler.prime();
+    std::thread::sleep(Duration::from_millis(1000));
+    let sample = sampler.sample();
+    let table = procs::snapshot();
+    let adapters = pick_adapters(gpu::adapters(), &sample, o.all);
+    let luids: Vec<u64> = adapters.iter().map(|a| a.luid).collect();
+    let rows = Scanner::default().rows(&sample, &table, &luids, o.min_mib);
+    let used: u64 = adapters.iter().map(|a| sample.adapter_used.get(&a.luid).copied().unwrap_or(0) / MIB).sum();
+    let total: u64 = adapters.iter().map(|a| a.dedicated / MIB).sum();
+    let groups = crate::agents::group(&rows);
+    let apps = crate::agents::apps(&groups, &table);
+    if o.json {
+        println!(
+            "{}",
+            obj([
+                ("time", fmt_utc(now_filetime()).into()),
+                ("used_mib", used.into()),
+                ("total_mib", total.into()),
+                ("sessions", Value::Arr(groups.iter().map(crate::agents::group_json).collect())),
+                ("apps", Value::Arr(apps.iter().map(crate::agents::app_json).collect())),
+            ])
+        );
+        return Ok(());
+    }
+    let names: Vec<&str> = adapters.iter().map(|a| a.name.as_str()).collect();
+    println!("{}: {} of {} MiB in use\n", names.join(", "), thousands(used), thousands(total));
+    if groups.is_empty() {
+        println!("No process holds GPU memory above the --min threshold.");
+        return Ok(());
+    }
+    let width = if o.wide { usize::MAX } else { crate::width() };
+    println!(
+        "{:<26} {:<16} {:<6} {:>9} {:>6} {:>5}  TITLE / JOBS",
+        "SESSION", "APP", "STATE", "VRAM MiB", "SHARE", "PROCS"
+    );
+    for g in &groups {
+        let state = match g.live {
+            Some(true) => "live",
+            Some(false) => "ended",
+            None => "–",
+        };
+        let mut what: Vec<String> = g.title.iter().map(|t| format!("“{t}”")).collect();
+        what.extend(g.jobs.iter().cloned());
+        let line = format!(
+            "{:<26} {:<16} {:<6} {:>9} {:>5.0}% {:>5}  {}",
+            ellipsize(&g.label, 26),
+            g.app.unwrap_or("–"),
+            state,
+            thousands(g.mib),
+            if total > 0 { g.mib as f64 * 100.0 / total as f64 } else { 0.0 },
+            g.pids.len(),
+            what.join(" · ")
+        );
+        println!("{}", ellipsize(&line, width));
+    }
+    println!();
+    for a in &apps {
+        let state = match a.running {
+            Some(true) if a.sessions == 0 => " (running; no session holds GPU memory)",
+            Some(false) => " (not running)",
+            _ => "",
+        };
+        println!(
+            "  {:<24} {:>9} MiB in {} {}{state}",
+            a.name,
+            thousands(a.mib),
+            a.sessions,
+            if a.harness.is_some() { "session(s)" } else { "group(s)" }
+        );
+        if let (Some(n), 0) = (a.note, a.sessions) {
+            println!("  {:<24} {n}", "");
+        }
     }
     Ok(())
 }

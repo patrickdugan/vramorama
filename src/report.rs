@@ -30,15 +30,18 @@ pub struct Report {
     pub bad_lines: usize,
 }
 
-/// Group key for a logged process: its owner tag, or for untagged processes the executable and pid.
-fn key_of(p: &Value) -> String {
-    match p.str("owner") {
+/// Group key for a logged process: its owner tag (or with `by_session` its agent session, which
+/// logs from before 0.6 do not have, so they fall back to the owner), or for untagged processes
+/// the executable and pid.
+fn key_of(p: &Value, by_session: bool) -> String {
+    let tag = if by_session { p.str("session_key").or_else(|| p.str("owner")) } else { p.str("owner") };
+    match tag {
         Some(o) => o.to_string(),
         None => format!("untagged {} pid {}", p.str("name").unwrap_or("?"), p.f64("pid").unwrap_or(0.0)),
     }
 }
 
-pub fn summarise(log: &str) -> Report {
+pub fn summarise(log: &str, by_session: bool) -> Report {
     let mut samples: Vec<Value> = Vec::new();
     let mut bad_lines = 0;
     for line in log.lines().filter(|l| !l.trim().is_empty()) {
@@ -65,14 +68,16 @@ pub fn summarise(log: &str) -> Report {
         // watcher does not count as hours of use.
         let dt = ts.get(i + 1).map_or(typical, |next| (next - ts[i]).min(3.0 * typical));
         let mut used = 0.0;
+        // Each holder's total in this sample, across its processes: the peak is the largest total.
+        let mut now: HashMap<String, f64> = HashMap::new();
         for a in s.arr("adapters") {
             used += a.f64("used_mib").unwrap_or(0.0);
             for p in a.arr("procs") {
                 let mib = p.f64("mib").unwrap_or(0.0);
-                let key = key_of(p);
+                let key = key_of(p, by_session);
+                *now.entry(key.clone()).or_insert(0.0) += mib;
                 let h = by_key.entry(key.clone()).or_insert_with(|| Holder { key, first: ts[i], ..Default::default() });
                 h.last = ts[i];
-                h.peak_mib = h.peak_mib.max(mib);
                 h.gib_hours += mib / 1024.0 * dt / 3600.0;
                 // A missing reading (null) is unknown, not idle.
                 if p.f64("util").is_some_and(|u| u < crate::idle::IDLE_UTIL) {
@@ -89,6 +94,11 @@ pub fn summarise(log: &str) -> Report {
                     let name = p.str("name").unwrap_or("?");
                     h.example_cmd = p.str("cmd").map(|c| format!("{name} {}", args_tail(c)).trim_end().to_string());
                 }
+            }
+        }
+        for (k, mib) in now {
+            if let Some(h) = by_key.get_mut(&k) {
+                h.peak_mib = h.peak_mib.max(mib);
             }
         }
         r.peak_used_mib = r.peak_used_mib.max(used);
@@ -188,7 +198,7 @@ mod tests {
             "not json".to_string(),
         ]
         .join("\n");
-        let r = summarise(&log);
+        let r = summarise(&log, false);
         assert_eq!(r.samples, 4);
         assert_eq!(r.bad_lines, 1);
         let q = r.holders.iter().find(|h| h.key == "claude:5f3c1e2a").unwrap();
@@ -205,8 +215,26 @@ mod tests {
     }
 
     #[test]
+    fn by_session_merges_a_sessions_labelled_jobs() {
+        let a =
+            r#"{"pid":1,"mib":4096,"util":90,"name":"python.exe","owner":"sweep-a","session_key":"claude:5f3c1e2a"}"#;
+        let b =
+            r#"{"pid":2,"mib":2048,"util":90,"name":"python.exe","owner":"sweep-b","session_key":"claude:5f3c1e2a"}"#;
+        // A line from an older version, without session_key.
+        let old = r#"{"pid":3,"mib":1024,"util":90,"name":"python.exe","owner":"codex:3c4d5e6f"}"#;
+        let log = [line(0.0, &format!("{a},{b},{old}")), line(60.0, &format!("{a},{b},{old}"))].join("\n");
+        let by_owner = summarise(&log, false);
+        assert_eq!(by_owner.holders.len(), 3);
+        let by_session = summarise(&log, true);
+        let keys: Vec<&str> = by_session.holders.iter().map(|h| h.key.as_str()).collect();
+        assert_eq!(keys, ["claude:5f3c1e2a", "codex:3c4d5e6f"]);
+        assert_eq!(by_session.holders[0].peak_mib, 6144.0, "the peak is the session's total, not its largest process");
+        assert_eq!(by_session.holders[0].pids.len(), 2);
+    }
+
+    #[test]
     fn empty_log() {
-        assert_eq!(summarise("").samples, 0);
-        assert!(render(&summarise(""), 80).contains("no samples"));
+        assert_eq!(summarise("", false).samples, 0);
+        assert!(render(&summarise("", false), 80).contains("no samples"));
     }
 }

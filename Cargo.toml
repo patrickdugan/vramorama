@@ -1,9 +1,9 @@
 [package]
 name = "vramorama"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Who is holding my GPU? Per-process VRAM with the agent session that launched it, for a single workstation."
+description = "Who is holding my GPU, and my RAM? Per-process VRAM and RAM with the agent session that launched it, for a single workstation."
 license = "MIT"
 repository = "https://github.com/patrickdugan/vramorama"
 readme = "README.md"

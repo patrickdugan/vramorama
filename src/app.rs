@@ -203,12 +203,16 @@ pub fn owner_text(r: &Row) -> String {
     if let Some(l) = &o.lease {
         return format!("lease {l}");
     }
+    if let Some((_, what)) = crate::scan::known_process(&r.name) {
+        return what.into();
+    }
     match (&r.root, r.note) {
         (_, Some(_)) => "unknown".into(),
         (Some(root), None) => format!("untagged, {root}"),
         (None, None) => "untagged".into(),
     }
 }
+
 pub fn command_text(r: &Row) -> String {
     let mut s = r.name.clone();
     if let Some(cwd) = &r.cwd {
@@ -468,82 +472,226 @@ fn session_transcript(o: &Owner) -> Option<std::path::PathBuf> {
     }
 }
 
-/// `vramorama sessions`: GPU memory per agent session (Claude Code, Cowork, the ChatGPT app's
-/// Codex, the Codex CLI), and per app.
-pub fn sessions(o: &Opts) -> Result<(), String> {
-    let mut sampler = Sampler::open()?;
-    sampler.prime();
-    std::thread::sleep(Duration::from_millis(1000));
-    let sample = sampler.sample();
+/// One look at the machine: the GPU processes, every process in an agent session (and big
+/// untagged ones) with its RAM, and the system's memory. Without GPU counters only RAM is seen.
+struct Look {
+    adapters: Vec<Adapter>,
+    vram_used: u64,
+    vram_total: u64,
+    gpu: Vec<Row>,
+    ram: Vec<Row>,
+    sys: Option<procs::SysMem>,
+    table: HashMap<u32, procs::Entry>,
+}
+
+fn look(o: &Opts) -> Look {
+    let mut sampler = Sampler::open().ok();
+    if let Some(s) = sampler.as_mut() {
+        s.prime();
+        std::thread::sleep(Duration::from_millis(1000));
+    }
     let table = procs::snapshot();
-    let adapters = pick_adapters(gpu::adapters(), &sample, o.all);
-    let luids: Vec<u64> = adapters.iter().map(|a| a.luid).collect();
-    let rows = Scanner::default().rows(&sample, &table, &luids, o.min_mib);
-    let used: u64 = adapters.iter().map(|a| sample.adapter_used.get(&a.luid).copied().unwrap_or(0) / MIB).sum();
-    let total: u64 = adapters.iter().map(|a| a.dedicated / MIB).sum();
-    let groups = crate::agents::group(&rows);
-    let apps = crate::agents::apps(&groups, &table);
+    let mem = procs::memory();
+    let mut scanner = Scanner::default();
+    let (mut adapters, mut gpu, mut vram_used) = (Vec::new(), Vec::new(), 0);
+    if let Some(s) = sampler.as_mut() {
+        let sample = s.sample();
+        adapters = pick_adapters(gpu::adapters(), &sample, o.all);
+        let luids: Vec<u64> = adapters.iter().map(|a| a.luid).collect();
+        gpu = scanner.rows(&sample, &table, &luids, o.min_mib);
+        crate::scan::attach_ram(&mut gpu, &mem);
+        vram_used = adapters.iter().map(|a| sample.adapter_used.get(&a.luid).copied().unwrap_or(0) / MIB).sum();
+    }
+    let ram = scanner.ram_rows(&table, &mem);
+    let vram_total = adapters.iter().map(|a| a.dedicated / MIB).sum();
+    Look { adapters, vram_used, vram_total, gpu, ram, sys: procs::system_memory(), table }
+}
+
+fn print_header(l: &Look) {
+    if !l.adapters.is_empty() {
+        let names: Vec<&str> = l.adapters.iter().map(|a| a.name.as_str()).collect();
+        println!("{}: {} of {} MiB in use", names.join(", "), thousands(l.vram_used), thousands(l.vram_total));
+    }
+    if let Some(s) = &l.sys {
+        let used = (s.total - s.avail.min(s.total)) / MIB;
+        let commit = (s.commit_limit - s.commit_avail.min(s.commit_limit)) / MIB;
+        println!(
+            "RAM: {} of {} MiB in use ({} available); {} of {} MiB committed",
+            thousands(used),
+            thousands(s.total / MIB),
+            thousands(s.avail / MIB),
+            thousands(commit),
+            thousands(s.commit_limit / MIB)
+        );
+    }
+}
+
+/// A session is listed when it holds GPU memory or at least this much RAM (`--min-ram`).
+const SESSION_MIN_RAM_MIB: u64 = 256;
+
+/// `vramorama sessions`: GPU memory and RAM per agent session (Claude Code, Cowork, the ChatGPT
+/// app's Codex, the Codex CLI), and per app.
+pub fn sessions(o: &Opts) -> Result<(), String> {
+    let l = look(o);
+    let groups = crate::agents::group(&l.gpu, &l.ram);
+    let apps = crate::agents::apps(&groups, &l.table);
     if o.json {
         println!(
             "{}",
             obj([
                 ("time", fmt_utc(now_filetime()).into()),
-                ("used_mib", used.into()),
-                ("total_mib", total.into()),
+                ("used_mib", l.vram_used.into()),
+                ("total_mib", l.vram_total.into()),
+                ("memory", l.sys.as_ref().map(crate::scan::system_memory_json).into()),
                 ("sessions", Value::Arr(groups.iter().map(crate::agents::group_json).collect())),
                 ("apps", Value::Arr(apps.iter().map(crate::agents::app_json).collect())),
             ])
         );
         return Ok(());
     }
-    let names: Vec<&str> = adapters.iter().map(|a| a.name.as_str()).collect();
-    println!("{}: {} of {} MiB in use\n", names.join(", "), thousands(used), thousands(total));
-    if groups.is_empty() {
-        println!("No process holds GPU memory above the --min threshold.");
-        return Ok(());
-    }
-    let width = if o.wide { usize::MAX } else { crate::width() };
-    println!(
-        "{:<26} {:<16} {:<6} {:>9} {:>6} {:>5}  TITLE / JOBS",
-        "SESSION", "APP", "STATE", "VRAM MiB", "SHARE", "PROCS"
-    );
-    for g in &groups {
-        let state = match g.live {
-            Some(true) => "live",
-            Some(false) => "ended",
-            None => "–",
-        };
-        let mut what: Vec<String> = g.title.iter().map(|t| format!("“{t}”")).collect();
-        what.extend(g.jobs.iter().cloned());
-        let line = format!(
-            "{:<26} {:<16} {:<6} {:>9} {:>5.0}% {:>5}  {}",
-            ellipsize(&g.label, 26),
-            g.app.unwrap_or("–"),
-            state,
-            thousands(g.mib),
-            if total > 0 { g.mib as f64 * 100.0 / total as f64 } else { 0.0 },
-            g.pids.len(),
-            what.join(" · ")
-        );
-        println!("{}", ellipsize(&line, width));
-    }
+    print_header(&l);
     println!();
+    let min_ram = o.min_ram.unwrap_or(SESSION_MIN_RAM_MIB);
+    let (shown, hidden): (Vec<&crate::agents::Group>, Vec<&crate::agents::Group>) =
+        groups.iter().partition(|g| g.mib > 0 || g.ram_mib + g.agent_mib >= min_ram);
+    if shown.is_empty() {
+        println!("No session holds GPU memory or {min_ram} MiB of RAM.");
+    } else {
+        let width = if o.wide { usize::MAX } else { crate::width() };
+        println!(
+            "{:<26} {:<16} {:<6} {:>9} {:>6} {:>9} {:>7} {:>5}  TITLE / JOBS",
+            "SESSION", "APP", "STATE", "VRAM MiB", "SHARE", "RAM MiB", "AGENT", "PROCS"
+        );
+        for g in &shown {
+            let state = match g.live {
+                Some(true) => "live",
+                Some(false) => "ended",
+                None => "–",
+            };
+            let mut what: Vec<String> = g.title.iter().map(|t| format!("“{t}”")).collect();
+            what.extend(g.jobs.iter().cloned());
+            let dash = |v: u64| if v > 0 { thousands(v) } else { "–".into() };
+            let line = format!(
+                "{:<26} {:<16} {:<6} {:>9} {:>5.0}% {:>9} {:>7} {:>5}  {}",
+                ellipsize(&g.label, 26),
+                g.app.unwrap_or("–"),
+                state,
+                dash(g.mib),
+                if l.vram_total > 0 { g.mib as f64 * 100.0 / l.vram_total as f64 } else { 0.0 },
+                dash(g.ram_mib),
+                dash(g.agent_mib),
+                g.ram_procs.max(g.pids.len()),
+                what.join(" · ")
+            );
+            println!("{}", ellipsize(&line, width));
+        }
+    }
+    if !hidden.is_empty() {
+        let mib: u64 = hidden.iter().map(|g| g.ram_mib + g.agent_mib).sum();
+        println!(
+            "  and {} more holding no GPU memory and under {min_ram} MiB of RAM each ({} MiB in all; --min-ram 0 lists them)",
+            hidden.len(),
+            thousands(mib)
+        );
+    }
+    println!(
+        "\nRAM is each process's private working set (Task Manager's Memory column); AGENT is the agent's own process.\n"
+    );
     for a in &apps {
         let state = match a.running {
-            Some(true) if a.sessions == 0 => " (running; no session holds GPU memory)",
+            Some(true) if a.sessions == 0 => " (running; no session holds GPU memory or RAM)",
             Some(false) => " (not running)",
             _ => "",
         };
         println!(
-            "  {:<24} {:>9} MiB in {} {}{state}",
+            "  {:<24} VRAM {:>7} MiB in {} · RAM {:>7} MiB in jobs + {} agent · {} {}{state}",
             a.name,
             thousands(a.mib),
+            a.gpu_sessions,
+            thousands(a.ram_mib),
+            thousands(a.agent_mib),
             a.sessions,
             if a.harness.is_some() { "session(s)" } else { "group(s)" }
         );
-        if let (Some(n), 0) = (a.note, a.sessions) {
+        if let (Some(n), 0) = (a.note, a.gpu_sessions) {
             println!("  {:<24} {n}", "");
         }
+    }
+    Ok(())
+}
+
+/// `vramorama ram`: the processes of agent sessions by RAM, with the agents' own processes and
+/// untagged processes of 1 GiB or more.
+pub fn ram(o: &Opts) -> Result<(), String> {
+    let l = look(o);
+    let min = if o.min_given { o.min_mib } else { 64 };
+    let rows: Vec<&Row> = l.ram.iter().filter(|r| r.ram.is_some_and(|m| m.private_mib >= min)).collect();
+    let vram = |pid: u32| -> u64 { l.gpu.iter().filter(|g| g.pid == pid).map(|g| g.mib).sum() };
+    if o.json {
+        let list = rows
+            .iter()
+            .map(|r| {
+                let mut j = crate::scan::row_json(r);
+                if let Value::Obj(kv) = &mut j {
+                    kv.push(("session_key".into(), r.session_group().0.into()));
+                    kv.push(("vram_mib".into(), vram(r.pid).into()));
+                }
+                j
+            })
+            .collect();
+        println!(
+            "{}",
+            obj([
+                ("time", fmt_utc(now_filetime()).into()),
+                ("memory", l.sys.as_ref().map(crate::scan::system_memory_json).into()),
+                ("processes", Value::Arr(list)),
+            ])
+        );
+        return Ok(());
+    }
+    print_header(&l);
+    let sum = |f: &dyn Fn(&Row) -> bool| -> (u64, usize) {
+        let m: Vec<&Row> = l.ram.iter().filter(|r| f(r)).collect();
+        (m.iter().map(|r| r.ram.map_or(0, |x| x.private_mib)).sum(), m.len())
+    };
+    let (jobs, jobs_n) = sum(&|r| !r.agent_proc && r.owner.is_tagged());
+    let (agents, agents_n) = sum(&|r| r.agent_proc);
+    let (big, big_n) = sum(&|r| !r.agent_proc && !r.owner.is_tagged());
+    println!(
+        "Agent sessions' jobs: {} MiB in {jobs_n} processes; the agents themselves: {} MiB in {agents_n}; \
+         untagged processes of 1 GiB or more: {} MiB in {big_n}\n",
+        thousands(jobs),
+        thousands(agents),
+        thousands(big)
+    );
+    if rows.is_empty() {
+        println!("No process in an agent session holds {min} MiB of RAM or more.");
+        return Ok(());
+    }
+    let width = if o.wide { usize::MAX } else { crate::width() };
+    println!(
+        "{:>7} {:>8} {:>8} {:>8}  {:<11}  {:<44}  COMMAND",
+        "PID", "RAM MiB", "COMMIT", "VRAM", "STARTED", "OWNER"
+    );
+    for r in rows {
+        let m = r.ram.unwrap_or_default();
+        let owner = if r.agent_proc {
+            format!("agent: {}", session_text(r).unwrap_or_else(|| owner_text(r)))
+        } else {
+            owner_text(r)
+        };
+        let v = vram(r.pid);
+        let line = format!(
+            "{:>7} {:>8} {:>8} {:>8}  {:<11}  {:<44}  {}",
+            r.pid,
+            thousands(m.private_mib),
+            thousands(m.commit_mib),
+            if v > 0 { thousands(v) } else { "–".into() },
+            r.started.map(fmt_short).unwrap_or_default(),
+            ellipsize(&owner, 44),
+            command_text(r)
+        );
+        println!("{}", ellipsize(&line, width));
     }
     Ok(())
 }
@@ -571,6 +719,9 @@ fn observe_window(window: f64, all: bool, min_mib: u64) -> Result<(Vec<Adapter>,
             *b = b.max(r.util.unwrap_or(0.0));
         }
     }
+    // A job whose claude.exe exited is not stale while its session runs on in another one.
+    let live = crate::scan::live_agent_sessions(&scanner.ram_rows(&procs::snapshot(), &procs::memory()));
+    crate::scan::revive(&mut rows, &live);
     let observed = rows
         .into_iter()
         .map(|r| {

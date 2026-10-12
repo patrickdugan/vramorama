@@ -189,6 +189,101 @@ fn to_u16(b: &[u8]) -> Vec<u16> {
     b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
 }
 
+/// The memory of one process, from the kernel's process list.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Mem {
+    /// Creation time (FILETIME), the same value `created` returns, which rules out recycled pids.
+    pub created: u64,
+    /// Private working set: the process's own pages in RAM (Task Manager's "Memory" column).
+    pub private_ws: u64,
+    /// Working set, including pages shared with other processes (mapped files, DLLs).
+    pub ws: u64,
+    pub peak_ws: u64,
+    /// Private bytes committed, in RAM or the page file: what counts against the commit limit.
+    pub commit: u64,
+}
+
+type NtQuerySystemInformation = unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
+const SYSTEM_PROCESS_INFORMATION: u32 = 5;
+const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+
+/// Memory of every process, in one call and without opening any process (so it covers
+/// protected and other users' processes too): `NtQuerySystemInformation(SystemProcessInformation)`.
+pub fn memory() -> HashMap<u32, Mem> {
+    let Some(ntdll) = Lib::mapped("ntdll.dll") else { return HashMap::new() };
+    let Some(query) = (unsafe { ntdll.get::<NtQuerySystemInformation>("NtQuerySystemInformation") }) else {
+        return HashMap::new();
+    };
+    let mut buf: Vec<u64> = vec![0; 1 << 17]; // 1 MiB, 8-byte aligned
+    for _ in 0..8 {
+        let bytes = (buf.len() * 8) as u32;
+        let mut needed = 0u32;
+        let st = unsafe { query(SYSTEM_PROCESS_INFORMATION, buf.as_mut_ptr() as *mut c_void, bytes, &mut needed) };
+        if st == STATUS_INFO_LENGTH_MISMATCH {
+            buf = vec![0; (needed.max(bytes) as usize * 2).div_ceil(8)];
+            continue;
+        }
+        if st < 0 {
+            return HashMap::new();
+        }
+        // SAFETY: reinterpreting initialised u64s as bytes.
+        let raw = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 8) };
+        return parse_process_list(raw);
+    }
+    HashMap::new()
+}
+
+/// Walk a SYSTEM_PROCESS_INFORMATION list (x64 layout). Entries are chained by
+/// NextEntryOffset; a truncated or malformed list ends the walk instead of reading past the end.
+pub fn parse_process_list(buf: &[u8]) -> HashMap<u32, Mem> {
+    const LEN: usize = 0xD0;
+    let u32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let u64_at = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    let mut out = HashMap::new();
+    let mut off = 0usize;
+    while off + LEN <= buf.len() {
+        let e = &buf[off..off + LEN];
+        let pid = u64_at(e, 0x50) as u32;
+        if pid != 0 {
+            out.insert(
+                pid,
+                Mem {
+                    created: u64_at(e, 0x20),
+                    private_ws: u64_at(e, 0x08),
+                    peak_ws: u64_at(e, 0x88),
+                    ws: u64_at(e, 0x90),
+                    commit: u64_at(e, 0xB8),
+                },
+            );
+        }
+        let next = u32_at(e, 0) as usize;
+        if next == 0 || next < LEN {
+            break;
+        }
+        off += next;
+    }
+    out
+}
+
+/// Physical memory and the commit charge, in bytes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SysMem {
+    pub total: u64,
+    pub avail: u64,
+    pub commit_limit: u64,
+    pub commit_avail: u64,
+}
+
+pub fn system_memory() -> Option<SysMem> {
+    let mut m = MemoryStatusEx { length: std::mem::size_of::<MemoryStatusEx>() as u32, ..Default::default() };
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(SysMem {
+        total: m.total_phys,
+        avail: m.avail_phys,
+        commit_limit: m.total_page_file,
+        commit_avail: m.avail_page_file,
+    })
+}
+
 /// The chain of live ancestors, nearest first, and the pid of the first parent that is gone
 /// (exited, or its pid was reused by a younger process).
 pub fn ancestry(pid: u32, table: &HashMap<u32, Entry>) -> (Vec<u32>, Option<u32>) {
@@ -214,4 +309,49 @@ pub fn ancestry(pid: u32, table: &HashMap<u32, Entry>) -> (Vec<u32>, Option<u32>
         cur_created = parent_created;
     }
     (chain, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(next: u32, pid: u64, created: u64, private_ws: u64, ws: u64, commit: u64) -> Vec<u8> {
+        let mut e = vec![0u8; 0xD0];
+        e[0..4].copy_from_slice(&next.to_le_bytes());
+        e[0x08..0x10].copy_from_slice(&private_ws.to_le_bytes());
+        e[0x20..0x28].copy_from_slice(&created.to_le_bytes());
+        e[0x50..0x58].copy_from_slice(&pid.to_le_bytes());
+        e[0x88..0x90].copy_from_slice(&(ws * 2).to_le_bytes());
+        e[0x90..0x98].copy_from_slice(&ws.to_le_bytes());
+        e[0xB8..0xC0].copy_from_slice(&commit.to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn process_list_walk() {
+        // The idle process (pid 0), then two processes; the second entry has room for thread records.
+        let mut buf = entry(0xD0, 0, 0, 0, 0, 0);
+        let mut a = entry(0x100, 4242, 133_000_000_000_000_001, 900 << 20, 1000 << 20, 1200 << 20);
+        a.resize(0x100, 0xEE);
+        buf.extend(a);
+        buf.extend(entry(0, 77, 133_000_000_000_000_002, 1 << 20, 2 << 20, 3 << 20));
+        let m = parse_process_list(&buf);
+        assert_eq!(m.len(), 2);
+        assert_eq!(
+            m[&4242],
+            Mem {
+                created: 133_000_000_000_000_001,
+                private_ws: 900 << 20,
+                ws: 1000 << 20,
+                peak_ws: 2000 << 20,
+                commit: 1200 << 20
+            }
+        );
+        assert_eq!(m[&77].commit, 3 << 20);
+        // A chain pointing past the end stops instead of reading out of bounds.
+        let mut bad = entry(0x4000, 9, 1, 1, 1, 1);
+        bad.truncate(0xD0);
+        assert_eq!(parse_process_list(&bad).len(), 1);
+        assert!(parse_process_list(&bad[..0x40]).is_empty());
+    }
 }

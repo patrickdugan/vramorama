@@ -31,7 +31,61 @@ pub struct Row {
     /// For untagged processes, where the launch chain starts (see `origin`).
     pub root: Option<String>,
     pub note: Option<&'static str>,
+    /// System memory the process holds, when it was read.
+    pub ram: Option<Ram>,
+    /// The agent's own process (Claude Code's `claude.exe`), not a job it started.
+    pub agent_proc: bool,
 }
+
+/// A process's system memory, in MiB.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Ram {
+    /// Private working set, as Task Manager's "Memory" column.
+    pub private_mib: u64,
+    pub ws_mib: u64,
+    pub peak_ws_mib: u64,
+    /// Private bytes committed (RAM or page file), what counts against the commit limit.
+    pub commit_mib: u64,
+}
+
+impl Ram {
+    pub fn of(m: &procs::Mem) -> Ram {
+        Ram {
+            private_mib: m.private_ws / MIB,
+            ws_mib: m.ws / MIB,
+            peak_ws_mib: m.peak_ws / MIB,
+            commit_mib: m.commit / MIB,
+        }
+    }
+}
+
+/// Fill in each row's system memory from the kernel's process list (skipping recycled pids).
+pub fn attach_ram(rows: &mut [Row], mem: &HashMap<u32, procs::Mem>) {
+    for r in rows {
+        r.ram = mem.get(&r.pid).filter(|m| r.started.is_none_or(|s| s == m.created)).map(Ram::of);
+    }
+}
+
+/// Claude sessions that have a Claude Code process running now (from `ram_rows`' agent processes).
+pub fn live_agent_sessions(ram_rows: &[Row]) -> std::collections::HashSet<String> {
+    ram_rows.iter().filter(|r| r.agent_proc).filter_map(|r| r.owner.claude.clone()).collect()
+}
+
+/// A Claude session can outlive the `claude.exe` its jobs were started from: resuming it, or the
+/// desktop app restarting, runs it in a new one. A job whose `CLAUDE_PID` has exited still belongs
+/// to a live session while another Claude Code process runs that session.
+pub fn revive(rows: &mut [Row], live: &std::collections::HashSet<String>) {
+    for r in rows {
+        let claude = matches!(r.owner.harness(), Some(Harness::Claude | Harness::Cowork));
+        if claude && r.harness_live == Some(false) && r.owner.claude.as_ref().is_some_and(|c| live.contains(c)) {
+            r.harness_live = Some(true);
+        }
+    }
+}
+
+/// Untagged processes are listed in the RAM view only from this size up: big enough for a job
+/// started outside any session (or WSL's VM), small enough to leave out browser tabs.
+pub const BIG_UNTAGGED_MIB: u64 = 1024;
 
 impl Row {
     /// Agent-session group: key and short label (`claude 5f3c1e2a`), or the job's owner, or for
@@ -46,10 +100,22 @@ impl Row {
             Some(k) => (k.clone(), k),
             None => {
                 let k = format!("untagged {} {}", self.name, self.pid);
-                (k.clone(), k)
+                let label = known_process(&self.name).map_or_else(|| k.clone(), |(short, _)| short.to_string());
+                (k, label)
             }
         }
     }
+}
+
+/// System processes that hold memory on behalf of many others, which no tag can say: a short
+/// name and a longer description.
+pub fn known_process(exe: &str) -> Option<(&'static str, &'static str)> {
+    Some(match exe.to_ascii_lowercase().as_str() {
+        "vmmemwsl" => ("WSL 2 virtual machine", "WSL 2 virtual machine (everything running inside WSL)"),
+        "vmmem" => ("Hyper-V virtual machine", "Hyper-V virtual machine"),
+        "memory compression" => ("Windows memory compression", "Windows memory compression (pages of other processes)"),
+        _ => return None,
+    })
 }
 
 /// What does not change while a process lives, cached by (pid, start time).
@@ -60,7 +126,9 @@ struct Fixed {
     cmd: Option<String>,
     cwd: Option<String>,
     owner: Owner,
-    root: Option<String>,
+    /// `origin` for untagged processes, worked out the first time a row needs it (it walks the
+    /// process tree, which is not worth doing for every process on the machine).
+    root: Option<Option<String>>,
     note: Option<&'static str>,
 }
 
@@ -78,53 +146,123 @@ impl Scanner {
                 continue;
             }
             let created = procs::created(u.pid);
-            let fixed = match self.cache.get(&(u.pid, created)) {
-                Some(f) => f.clone(),
-                None => {
-                    let f = self.fixed(u.pid, table);
-                    self.cache.insert((u.pid, created), f.clone());
-                    f
-                }
-            };
-            let harness_live = fixed.owner.harness_pid.and_then(|hp| procs::alive(hp, fixed.started));
-            let title = self.titles.title(&fixed.owner);
-            rows.push(Row {
-                pid: u.pid,
-                luid: u.luid,
-                mib: u.dedicated / MIB,
-                shared_mib: u.shared / MIB,
-                util: u.util,
-                name: fixed.name,
-                started: fixed.started,
-                cmd: fixed.cmd,
-                cwd: fixed.cwd,
-                owner: fixed.owner,
-                title,
-                harness_live,
-                root: fixed.root,
-                note: fixed.note,
-            });
+            let fixed = self.fixed(u.pid, created, table, true);
+            let mut r = self.row(u.pid, fixed);
+            (r.luid, r.mib, r.shared_mib, r.util) = (u.luid, u.dedicated / MIB, u.shared / MIB, u.util);
+            rows.push(r);
         }
         rows.sort_by(|a, b| b.mib.cmp(&a.mib).then(a.pid.cmp(&b.pid)));
         rows
     }
 
-    fn fixed(&mut self, pid: u32, table: &HashMap<u32, Entry>) -> Fixed {
-        let d = procs::details(pid);
-        let mut owner = d.env.as_deref().map(Owner::from_env).unwrap_or_default();
-        if owner.codex.is_some() {
-            resolve_harness(&mut owner, pid, table);
+    /// Every process in an agent session (its tags say so), the agent's own Claude Code process
+    /// (attributed to its session through the `CLAUDE_PID` its shells carry, or through the desktop
+    /// app's session record), and untagged processes holding at least `BIG_UNTAGGED_MIB` of private
+    /// memory, with their system memory. Largest first.
+    pub fn ram_rows(&mut self, table: &HashMap<u32, Entry>, mem: &HashMap<u32, procs::Mem>) -> Vec<Row> {
+        // Forget processes that have exited, so a long-running `gui` does not keep every shell
+        // it ever saw.
+        self.cache.retain(|(pid, created), _| mem.get(pid).is_some_and(|m| created.is_none_or(|c| c == m.created)));
+        let mut fixed: Vec<(u32, &procs::Mem, Fixed)> = Vec::new();
+        for (&pid, m) in mem {
+            if pid <= 4 {
+                continue; // System Idle Process and System
+            }
+            let f = self.fixed(pid, Some(m.created), table, false);
+            fixed.push((pid, m, f));
         }
-        let root = if owner.is_tagged() { None } else { origin(pid, table) };
-        Fixed {
-            name: table.get(&pid).map(|e| e.exe.clone()).unwrap_or_else(|| "?".into()),
-            started: d.created,
-            cmd: d.cmdline,
-            cwd: d.cwd,
-            owner,
-            root,
-            note: d.note,
+        // Claude Code's own process carries the desktop app's session id but not its own session
+        // id; the shells it starts name it in CLAUDE_PID.
+        let mut agents: HashMap<u32, Owner> = HashMap::new();
+        for (_, _, f) in &fixed {
+            if let (Some(hp), Some(Harness::Claude | Harness::Cowork)) = (f.owner.harness_pid, f.owner.harness()) {
+                agents.entry(hp).or_insert_with(|| Owner { label: None, lease: None, ..f.owner.clone() });
+            }
         }
+        let mut rows = Vec::new();
+        for (pid, m, mut f) in fixed {
+            // Claude Code marks its own process AI_AGENT=claude-code_<version>_harness.
+            let mut agent_proc = f.owner.agent.as_deref().is_some_and(|a| a.ends_with("_harness"));
+            if f.owner.claude.is_none() && f.owner.codex.is_none() {
+                if let Some(o) = agents.get(&pid) {
+                    f.owner = o.clone();
+                    agent_proc = true;
+                } else if agent_proc {
+                    // A Claude Code process with no shell running: its desktop session record names it.
+                    if let Some(d) = f.owner.claude_host.as_deref().and_then(|h| self.titles.by_host(h)) {
+                        f.owner.claude = d.cli_session;
+                        f.owner.claude_entry = Some(if d.cowork { "local-agent" } else { "claude-desktop" }.into());
+                    }
+                }
+            }
+            if !(f.owner.is_tagged() || agent_proc) && m.private_ws < BIG_UNTAGGED_MIB * MIB {
+                continue;
+            }
+            if !f.owner.is_tagged() && f.root.is_none() {
+                f = self.fixed(pid, Some(m.created), table, true);
+            }
+            let mut r = self.row(pid, f);
+            r.ram = Some(Ram::of(m));
+            r.agent_proc = agent_proc;
+            if agent_proc {
+                r.harness_live = Some(true);
+            }
+            rows.push(r);
+        }
+        let live = live_agent_sessions(&rows);
+        revive(&mut rows, &live);
+        rows.sort_by(|a, b| {
+            let p = |r: &Row| r.ram.map_or(0, |m| m.private_mib);
+            p(b).cmp(&p(a)).then(a.pid.cmp(&b.pid))
+        });
+        rows
+    }
+
+    fn row(&mut self, pid: u32, f: Fixed) -> Row {
+        let harness_live = f.owner.harness_pid.and_then(|hp| procs::alive(hp, f.started));
+        Row {
+            pid,
+            luid: 0,
+            mib: 0,
+            shared_mib: 0,
+            util: None,
+            name: f.name,
+            started: f.started,
+            cmd: f.cmd,
+            cwd: f.cwd,
+            title: self.titles.title(&f.owner),
+            owner: f.owner,
+            harness_live,
+            root: f.root.flatten(),
+            note: f.note,
+            ram: None,
+            agent_proc: false,
+        }
+    }
+
+    /// The cached facts about a process, read on first sight; `root` also works out where an
+    /// untagged process's launch chain starts.
+    fn fixed(&mut self, pid: u32, created: Option<u64>, table: &HashMap<u32, Entry>, root: bool) -> Fixed {
+        let f = self.cache.entry((pid, created)).or_insert_with(|| {
+            let d = procs::details(pid);
+            let mut owner = d.env.as_deref().map(Owner::from_env).unwrap_or_default();
+            if owner.codex.is_some() {
+                resolve_harness(&mut owner, pid, table);
+            }
+            Fixed {
+                name: table.get(&pid).map(|e| e.exe.clone()).unwrap_or_else(|| "?".into()),
+                started: d.created,
+                cmd: d.cmdline,
+                cwd: d.cwd,
+                root: owner.is_tagged().then_some(None),
+                owner,
+                note: d.note,
+            }
+        });
+        if root && f.root.is_none() {
+            f.root = Some(origin(pid, table));
+        }
+        f.clone()
     }
 }
 
@@ -242,6 +380,21 @@ pub fn row_json(r: &Row) -> Value {
         ("cwd", r.cwd.clone().into()),
         ("cmd", r.cmd.clone().into()),
         ("note", r.note.into()),
+        ("ram_mib", r.ram.map(|m| m.private_mib).into()),
+        ("ws_mib", r.ram.map(|m| m.ws_mib).into()),
+        ("commit_mib", r.ram.map(|m| m.commit_mib).into()),
+        ("agent_proc", r.agent_proc.into()),
+    ])
+}
+
+/// System memory, in MiB, for the JSON outputs.
+pub fn system_memory_json(s: &procs::SysMem) -> Value {
+    obj([
+        ("total_mib", (s.total / MIB).into()),
+        ("used_mib", ((s.total - s.avail.min(s.total)) / MIB).into()),
+        ("available_mib", (s.avail / MIB).into()),
+        ("commit_mib", ((s.commit_limit - s.commit_avail.min(s.commit_limit)) / MIB).into()),
+        ("commit_limit_mib", (s.commit_limit / MIB).into()),
     ])
 }
 

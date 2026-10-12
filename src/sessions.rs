@@ -200,6 +200,12 @@ impl Titles {
         by_host.or_else(|| self.desktop.iter().find(|d| d.cli_session.as_deref() == Some(cli))).cloned()
     }
 
+    /// The desktop record with this `local_<uuid>` id (`CLAUDE_CODE_HOST_SESSION_ID`).
+    pub fn by_host(&mut self, host: &str) -> Option<DesktopSession> {
+        self.refresh();
+        self.desktop.iter().find(|d| d.id == host).cloned()
+    }
+
     /// What the session's app calls it.
     pub fn title(&mut self, o: &Owner) -> Option<String> {
         match o.harness()? {

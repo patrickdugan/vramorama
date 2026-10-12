@@ -73,8 +73,25 @@ pub struct ConsoleScreenBufferInfo {
     pub max_window: [i16; 2],
 }
 
+/// MEMORYSTATUSEX.
+#[repr(C)]
+#[derive(Default)]
+pub struct MemoryStatusEx {
+    pub length: u32,
+    pub memory_load: u32,
+    pub total_phys: u64,
+    pub avail_phys: u64,
+    /// The commit limit (RAM plus page files) and how much of it is not yet committed.
+    pub total_page_file: u64,
+    pub avail_page_file: u64,
+    pub total_virtual: u64,
+    pub avail_virtual: u64,
+    pub avail_extended_virtual: u64,
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    pub fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
     pub fn LoadLibraryW(name: *const u16) -> Handle;
     pub fn GetModuleHandleW(name: *const u16) -> Handle;
     pub fn GetProcAddress(module: Handle, name: *const u8) -> *const c_void;

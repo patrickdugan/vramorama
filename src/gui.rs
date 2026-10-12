@@ -118,10 +118,63 @@ impl Tally {
             .collect()
     }
 
-    fn point(&self) -> Value {
-        Value::Obj(self.now.iter().map(|(k, v)| (k.clone(), (*v).into())).collect())
+    /// A group seen with no memory of this kind yet (a session holding only RAM): listed with zeros.
+    fn touch(&mut self, key: &str, label: &str, ts: f64) {
+        self.stats.entry(key.to_string()).or_insert_with(|| Stats {
+            label: label.to_string(),
+            peak: 0,
+            peak_ts: ts,
+            first_ts: ts,
+            last_ts: ts,
+            gib_h: 0.0,
+            idle_gib_h: 0.0,
+            meta: Vec::new(),
+        });
+    }
+
+    /// Current values of at least `min` MiB, for one timeline point.
+    fn point(&self, min: u64) -> Value {
+        Value::Obj(self.now.iter().filter(|(_, v)| **v >= min.max(1)).map(|(k, v)| (k.clone(), (*v).into())).collect())
     }
 }
+
+/// Fields of a session group that change from sample to sample; the rest is kept as metadata.
+const LIVE_FIELDS: &[&str] =
+    &["key", "label", "mib", "idle_mib", "pids", "ram_mib", "commit_mib", "ram_procs", "agent_mib"];
+
+/// Sessions for the page: the GPU tally (which lists every group seen), with each group's RAM now
+/// (zero once it is gone) and its RAM peak and GiB-hours.
+fn session_list(sessions: &Tally, ram: &Tally, groups: &[crate::agents::Group]) -> Vec<Value> {
+    sessions
+        .json()
+        .into_iter()
+        .map(|mut v| {
+            let key = v.str("key").unwrap_or_default().to_string();
+            let g = groups.iter().find(|g| g.key == key);
+            let r = ram.stats.get(&key);
+            if let Value::Obj(kv) = &mut v {
+                let live = |f: fn(&crate::agents::Group) -> u64| g.map_or(0, f);
+                kv.push(("idle_mib".into(), live(|g| g.idle_mib).into()));
+                kv.push((
+                    "pids".into(),
+                    Value::Arr(g.map(|g| g.pids.iter().map(|&p| p.into()).collect()).unwrap_or_default()),
+                ));
+                kv.push(("ram_mib".into(), live(|g| g.ram_mib).into()));
+                kv.push(("agent_mib".into(), live(|g| g.agent_mib).into()));
+                kv.push(("commit_mib".into(), live(|g| g.commit_mib).into()));
+                kv.push(("ram_procs".into(), live(|g| g.ram_procs as u64).into()));
+                kv.push(("ram_peak_mib".into(), r.map_or(0, |s| s.peak).into()));
+                kv.push(("ram_gib_hours".into(), r.map_or(0.0, |s| s.gib_h).into()));
+            }
+            v
+        })
+        .collect()
+}
+
+/// RAM processes are listed on the page from this size up (all of them count in the totals).
+const RAM_PROC_MIN_MIB: u64 = 64;
+/// Sessions get a line on the RAM timeline from this much RAM up, as they get a bar segment.
+const SESSION_MIN_RAM_MIB: u64 = 256;
 
 #[derive(Default)]
 struct Shared {
@@ -168,6 +221,8 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
     let mut idle_since: HashMap<(u32, u64), f64> = HashMap::new();
     let mut owners = Tally::default();
     let mut sessions = Tally::default();
+    // RAM per session: its jobs plus the agent's own process.
+    let mut ram_tally = Tally::default();
     // Tags of the session that asked for each lease, looked up once per lease.
     let mut lease_owners: HashMap<String, Option<crate::owner::Owner>> = HashMap::new();
     let started = filetime_to_unix(now_filetime());
@@ -178,7 +233,11 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
         let table = procs::snapshot();
         let adapters = pick_adapters(dxgi.clone(), &sample, all);
         let luids: Vec<u64> = adapters.iter().map(|a| a.luid).collect();
-        let rows = scanner.rows(&sample, &table, &luids, min_mib);
+        let mut rows = scanner.rows(&sample, &table, &luids, min_mib);
+        let mem = procs::memory();
+        let sys = procs::system_memory();
+        crate::scan::attach_ram(&mut rows, &mem);
+        let ram_rows = scanner.ram_rows(&table, &mem);
         let ft = now_filetime();
         let ts = filetime_to_unix(ft);
         let dt = last_ts.map_or(interval, |l| (ts - l).min(3.0 * interval));
@@ -215,14 +274,45 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
         }
         owners.end(ts);
         sessions.end(ts);
-        let groups = crate::agents::group(&rows);
+        ram_tally.begin();
+        let mut ram_json: Vec<Value> = Vec::new();
+        for r in &ram_rows {
+            let (skey, slabel) = r.session_group();
+            let mib = r.ram.map_or(0, |m| m.private_mib);
+            ram_tally.add(&skey, &slabel, mib, false, ts, dt);
+            sessions.touch(&skey, &slabel, ts);
+            if mib >= RAM_PROC_MIN_MIB && ram_json.len() < 200 {
+                let (okey, olabel) = mark_key(r);
+                let vram: u64 = rows.iter().filter(|g| g.pid == r.pid).map(|g| g.mib).sum();
+                let mut v = proc_json(r, 0, None, "", "", okey, olabel);
+                if let Value::Obj(kv) = &mut v {
+                    kv.push(("vram_mib".into(), vram.into()));
+                }
+                ram_json.push(v);
+            }
+        }
+        ram_tally.end(ts);
+        let groups = crate::agents::group(&rows, &ram_rows);
         for g in &groups {
             if let (Some(s), Value::Obj(kv)) = (sessions.stats.get_mut(&g.key), crate::agents::group_json(g)) {
-                // Everything but the running totals, which the tally keeps.
-                s.meta = kv.into_iter().filter(|(k, _)| !matches!(k.as_str(), "key" | "label" | "mib")).collect();
+                // What does not change from sample to sample; `session_list` adds the rest.
+                s.meta = kv.into_iter().filter(|(k, _)| !LIVE_FIELDS.contains(&k.as_str())).collect();
             }
         }
         let apps: Vec<Value> = crate::agents::apps(&groups, &table).iter().map(crate::agents::app_json).collect();
+        let memory = sys.as_ref().map(|s| {
+            let mut v = crate::scan::system_memory_json(s);
+            let sum = |f: &dyn Fn(&Row) -> bool| -> u64 {
+                ram_rows.iter().filter(|r| f(r)).map(|r| r.ram.map_or(0, |m| m.private_mib)).sum()
+            };
+            if let Value::Obj(kv) = &mut v {
+                kv.push(("jobs_mib".into(), sum(&|r| !r.agent_proc && r.owner.is_tagged()).into()));
+                kv.push(("agents_mib".into(), sum(&|r| r.agent_proc).into()));
+                kv.push(("untagged_big_mib".into(), sum(&|r| !r.agent_proc && !r.owner.is_tagged()).into()));
+            }
+            v
+        });
+        let ram_used = sys.map(|s| (s.total - s.avail.min(s.total)) / MIB);
 
         // Leases: memory per lease from the processes' tags; the ledger is only read here.
         let mut by_lease: HashMap<String, u64> = HashMap::new();
@@ -287,14 +377,22 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
             ("reserved_mib", outstanding.into()),
             ("adapters", Value::Arr(adapter_list)),
             ("owners", Value::Arr(owners.json())),
-            ("sessions", Value::Arr(sessions.json())),
+            ("sessions", Value::Arr(session_list(&sessions, &ram_tally, &groups))),
             ("apps", Value::Arr(apps)),
+            ("memory", memory.into()),
+            ("ram_procs", Value::Arr(ram_json)),
             ("leases", Value::Arr(lease_json)),
             ("untracked_leases", Value::Arr(untracked)),
             ("ledger", ledger::dir().map(|d| d.display().to_string()).into()),
         ]);
-        let point =
-            obj([("ts", ts.into()), ("used", used_total.into()), ("o", owners.point()), ("s", sessions.point())]);
+        let point = obj([
+            ("ts", ts.into()),
+            ("used", used_total.into()),
+            ("o", owners.point(1)),
+            ("s", sessions.point(1)),
+            ("ru", ram_used.into()),
+            ("r", ram_tally.point(SESSION_MIN_RAM_MIB)),
+        ]);
         let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
         s.now = now.to_string();
         s.points.push_back((ts, point.to_string()));

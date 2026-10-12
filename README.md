@@ -1,26 +1,34 @@
 # vramorama
 
-**Who is holding my GPU?** Per-process VRAM on a single workstation, with the agent session that
-launched each process: Claude Code, Claude Cowork, the ChatGPT desktop app's Codex agent, or the
-Codex CLI.
+**Who is holding my GPU, and my RAM?** Per-process VRAM and RAM on a single workstation, with the
+agent session that launched each process: Claude Code, Claude Cowork, the ChatGPT desktop app's
+Codex agent, or the Codex CLI.
 
 When several coding agents (and you) share one GPU, the card fills up overnight and nobody can say
 what is on it. On Windows `nvidia-smi` cannot even tell you how much memory each process holds:
 under the WDDM driver model NVML reports it as `N/A`. vramorama reads the numbers Windows keeps for
-Task Manager, then works out *who* owns each process, and how much each agent session holds:
+Task Manager, then works out *who* owns each process, and how much each agent session holds, on the
+card and in RAM, counting every Python job, server and shell the session started:
 
 ```text
 > vramorama sessions
 NVIDIA GeForce RTX 5080 Laptop GPU: 15,802 of 15,915 MiB in use
+RAM: 30,911 of 31,864 MiB in use (953 available); 86,439 of 112,080 MiB committed
 
-SESSION                    APP              STATE   VRAM MiB  SHARE PROCS  TITLE / JOBS
-claude a91d07c4            Claude Code      live       9,479    60%     1  “Nightly eval queue” · lr-sweep #234228b0
-chatgpt 3c4d5e6f           ChatGPT (Codex)  live       6,317    40%     2  “Fine-tune the reranker”
+SESSION                    APP              STATE   VRAM MiB  SHARE   RAM MiB   AGENT PROCS  TITLE / JOBS
+claude a91d07c4            Claude Code      live       9,479    60%     7,024      71     6  “Nightly eval queue” · lr-sweep #234228b0
+chatgpt 3c4d5e6f           ChatGPT (Codex)  live       6,317    40%     3,232       –     4  “Fine-tune the reranker”
+claude 5e6f7a8b            Claude Code      live           –     0%       904     136     7  “Data cleaning”
+WSL 2 virtual machine      –                –              –     0%     4,256       –     1
+  and 5 more holding no GPU memory and under 256 MiB of RAM each (710 MiB in all; --min-ram 0 lists them)
 
-  Claude Code                  9,479 MiB in 1 session(s)
-  Claude Cowork                    0 MiB in 0 session(s) (running; no session holds GPU memory)
+RAM is each process's private working set (Task Manager's Memory column); AGENT is the agent's own process.
+
+  Claude Code              VRAM   9,479 MiB in 1 · RAM   7,928 MiB in jobs + 207 agent · 7 session(s)
+  Claude Cowork            VRAM       0 MiB in 0 · RAM       0 MiB in jobs + 0 agent · 0 session(s) (running; no session holds GPU memory or RAM)
                            Cowork sessions run in a virtual machine with no GPU access, so they hold no VRAM here.
-  ChatGPT (Codex)              6,317 MiB in 1 session(s)
+  ChatGPT (Codex)          VRAM   6,317 MiB in 1 · RAM   3,232 MiB in jobs + 0 agent · 1 session(s)
+  Outside agent sessions   VRAM       0 MiB in 0 · RAM   4,256 MiB in jobs + 0 agent · 1 group(s)
 ```
 
 ```text
@@ -66,7 +74,8 @@ is required: no SDK headers, no import libraries beyond what Rust itself links.
 |---|---|
 | `vramorama gui` | A live page in your browser: memory by agent session and by app, an hour of history, every process with its session, job and idle state, watermarks, leases, and one-click trace. See [The GUI](#the-gui). |
 | `vramorama` / `vramorama ps` | Processes holding GPU memory now, with owner, start time, working folder and command. `--json`, `--all` (include integrated GPUs), `--min MIB` (default 16), `--wide`, `--trace` (trace every untagged process). |
-| `vramorama sessions` | GPU memory per agent session (its app, title, whether it is still running, its share of the card, its processes and labelled jobs), and per agent app. `--json` for agents and scripts. |
+| `vramorama sessions` | GPU memory and RAM per agent session (its app, title, whether it is still running, its share of the card, its jobs' RAM and its agent's own, its processes and labelled jobs), and per agent app. Lists sessions holding GPU memory or at least `--min-ram` MiB of RAM (default 256). `--json` for agents and scripts. |
+| `vramorama ram` | Processes of agent sessions by RAM, with commit, VRAM, start time, session and command; the agents' own processes; and untagged processes of 1 GiB or more. `--min MIB` (default 64 here), `--json`. See [RAM](#ram). |
 | `vramorama watch` | Refreshes every `--interval` seconds (default 5) and keeps a **running watermark**: each process's peak and how long it has been idle, and each owner's current and peak total. `--log FILE` appends one JSON line per sample; `--quiet` only logs. |
 | `vramorama report FILE` | Summarises a watch log: GiB-hours (and how many of them were *idle*, held at under 1% GPU), peak, GPU% and time held per owner, or with `--by session` per agent session. Answers "what sat on the card all night?" Gaps (sleep, a stopped watcher) are capped so they do not count as use. `--json`. |
 | `vramorama trace PID` | For an untagged process: its full launch chain, and the agent transcript that typed the command. |
@@ -92,14 +101,17 @@ vramorama gui --port 0 --no-open   # any free port; just print the link
 ```
 
 The page shows, for each GPU, memory in use as a bar split by agent session (titled as the
-session's app titles it), what a new lease could get, and how much is held idle or stale. Below
-that, **Agent sessions**: a tile per agent app on this machine (Claude Code, Claude Cowork, the
+session's app titles it), what a new lease could get, and how much is held idle or stale; then
+**System memory**, RAM in use as a bar split by the same sessions, with what is available, what
+the agents' jobs and the agents themselves hold, and the commit charge, and a warning when RAM or
+commit runs short. Below that, **Agent sessions**: a tile per agent app on this machine (Claude Code, Claude Cowork, the
 ChatGPT app, the Codex CLI, and everything outside agent sessions) with what its sessions hold,
 and a row per session with its app, whether it is still running, its memory and share of the card,
-peak, GiB-hours, idle GiB-hours and the labelled jobs inside it. Click a session to filter the
-process table to it. Then a timeline of each session's memory over the last 5 minutes to an hour;
-every process with its session, job, memory and peak, GPU %, idle time and verdict, start time and
-command; per-session watermarks; and the lease ledger, with the session that asked for each lease.
+peak, GiB-hours, idle GiB-hours, RAM and RAM peak, and the labelled jobs inside it. Click a session
+to filter the process tables to it. Then a timeline of each session's GPU memory, or RAM, over the
+last 5 minutes to an hour; every GPU process with its session, job, memory and peak, GPU %, RAM,
+idle time and verdict, start time and command; every process holding RAM (see [RAM](#ram));
+per-session watermarks; and the lease ledger, with the session that asked for each lease.
 **By job** switches the bar, timeline and watermarks to group by job label instead.
 **Trace** on an untagged process runs `vramorama trace` and shows the launch chain and the session
 that launched it. A stale process gets **Copy stop command**; the page never stops anything itself.
@@ -187,6 +199,36 @@ $envList = [string[]](Get-ChildItem env: | ForEach-Object { "$($_.Name)=$($_.Val
 $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ EnvironmentVariables = $envList }
 Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd; ProcessStartupInformation = $startup }
 ```
+
+## RAM
+
+GPU jobs are rarely only GPU jobs: data loaders, tokenizers, evaluation servers and the model's
+host-side copies live in system memory, and an agent session runs Python, Node, browsers and shells
+of its own. When several sessions share a machine, RAM runs out as often as VRAM does, and on
+Windows that does not fail either: the memory manager pages processes to disk and everything,
+GPU jobs included, slows down.
+
+`vramorama ram`, `vramorama sessions` and the GUI count, for each agent session:
+
+- **Its jobs**: every process carrying the session's tags (the same inherited variables as for GPU
+  memory, so a `vramorama run` job, its workers, an MCP server and a test runner all count).
+- **The agent itself**: Claude Code's own `claude.exe`. It does not carry its session id, but the
+  shells it starts name it in `CLAUDE_PID`, and the desktop app's session record names it too.
+  It is counted apart from the jobs. The Codex app server is shared by every thread, so it is not
+  split between them.
+- **Big untagged processes**: anything of 1 GiB or more outside every session, so a job detached
+  through WMI or the WSL 2 virtual machine (`vmmemWSL`, which holds the memory of everything
+  running inside WSL) does not hide.
+
+RAM is the **private working set**, what Task Manager's Memory column shows: the process's own
+pages in RAM, not counting pages shared with other processes (mapped model files, DLLs). **Commit**
+is private memory reserved in RAM or the page file; when the system's commit charge reaches its
+limit, allocations fail. The GUI warns when less than 5% of RAM is available or commit is above
+90% of its limit.
+
+A Claude session can outlive the `claude.exe` its jobs were started from (resuming it, or the
+desktop app restarting, starts a new one); its jobs count as live, and are never called stale,
+while another Claude Code process runs the session.
 
 ## Sharing the card: `vramorama run`
 
@@ -318,6 +360,11 @@ stays with whoever runs the command.
   same two sets show spill; without them vramorama works as before, minus the spill check.
 - **Adapters:** DXGI, to name each adapter and its dedicated memory. By default only adapters with at
   least 1 GiB of dedicated memory are shown, which hides integrated GPUs; `--all` shows them.
+- **RAM:** one `NtQuerySystemInformation(SystemProcessInformation)` call returns every process's
+  private working set, working set, commit and start time without opening any process;
+  `GlobalMemoryStatusEx` gives installed RAM, available RAM and the commit charge. To attribute
+  RAM, vramorama reads the environment of every process it can open, once per process (cached by
+  pid and start time), and keeps only the tags.
 - **Processes:** a Toolhelp snapshot for the tree; `NtQueryInformationProcess` and
   `ReadProcessMemory` for the command line, working folder and environment; `GetProcessTimes` to
   rule out recycled pids when walking parents.
@@ -351,7 +398,9 @@ workflow uses no third-party actions (it checks out with plain `git`).
   environment; their memory is still shown. 32-bit processes are listed without environment.
 - Tags are cooperative, not a security boundary: any process can set or clear them.
 - WSL2: processes inside WSL do not appear individually (NVML in WSL lists no processes). How their
-  memory shows up on the host is untested; at worst it is in the adapter's "elsewhere" figure.
+  GPU memory shows up on the host is untested; at worst it is in the adapter's "elsewhere" figure.
+  Their RAM is all in the `vmmemWSL` process, shown as the WSL 2 virtual machine, and cannot be
+  split by session.
 - Microsoft notes that the GPU memory counters can occasionally misreport; they are what Task
   Manager shows.
 

@@ -37,9 +37,14 @@ vramorama: who is holding my GPU?
 USAGE
   vramorama [ps] [--json] [--all] [--min MIB] [--wide] [--trace]
       Processes holding GPU memory now, with the agent session that launched each one.
-  vramorama sessions [--json] [--all] [--min MIB] [--wide]
-      GPU memory per agent session (Claude Code, Claude Cowork, the ChatGPT app's Codex,
-      the Codex CLI) and per app. Labelled jobs count against the session that started them.
+  vramorama sessions [--json] [--all] [--min MIB] [--min-ram MIB] [--wide]
+      GPU memory and RAM per agent session (Claude Code, Claude Cowork, the ChatGPT app's
+      Codex, the Codex CLI) and per app. Labelled jobs count against the session that started
+      them; the agent's own process is counted apart. Lists sessions holding GPU memory or at
+      least --min-ram MiB of RAM (default 256).
+  vramorama ram [--json] [--min MIB] [--wide]
+      Processes of agent sessions by RAM (private working set, as Task Manager shows), with the
+      agents' own processes and untagged processes of 1 GiB or more. --min defaults to 64 here.
   vramorama watch [--interval SECS] [--log FILE] [--quiet] [--all] [--min MIB]
       Refresh every SECS (default 5), keeping each process's and each owner's peak
       (the running watermark). --log appends one JSON line per sample.
@@ -112,6 +117,7 @@ pub struct Opts {
     pub port: Option<u16>,
     pub no_open: bool,
     pub by_session: bool,
+    pub min_ram: Option<u64>,
     pub positional: Vec<String>,
 }
 
@@ -129,6 +135,9 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--min" => {
                 o.min_mib = value("--min")?.parse().map_err(|_| "--min takes a whole number of MiB")?;
                 o.min_given = true;
+            }
+            "--min-ram" => {
+                o.min_ram = Some(value("--min-ram")?.parse().map_err(|_| "--min-ram takes a whole number of MiB")?)
             }
             "--force" => o.force = true,
             "--no-open" => o.no_open = true,
@@ -204,7 +213,7 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         "run" => os_run(rest),
-        "ps" | "sessions" | "watch" | "trace" | "leases" | "idle" | "gui" => {
+        "ps" | "sessions" | "ram" | "watch" | "trace" | "leases" | "idle" | "gui" => {
             os_command(cmd, parse_opts(rest)?).map(|()| 0)
         }
         "reclaim" => os_reclaim(parse_opts(rest)?),
@@ -217,6 +226,7 @@ fn os_command(cmd: &str, o: Opts) -> Result<(), String> {
     match cmd {
         "ps" => app::ps(&o),
         "sessions" => app::sessions(&o),
+        "ram" => app::ram(&o),
         "watch" => app::watch(&o),
         "leases" => run::leases(o.json, o.adapter.as_deref(), o.headroom_mib),
         "gui" => gui::gui(gui::GuiOpts {

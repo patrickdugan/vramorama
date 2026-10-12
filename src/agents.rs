@@ -1,6 +1,6 @@
-//! GPU memory per agent session, and per agent app: the view that answers "which session holds
-//! how much?". A process belongs to the session whose tags it inherited (see `owner.rs`); a job's
-//! `VRAMORAMA_OWNER` label names the job inside its session instead of hiding the session.
+//! GPU memory and RAM per agent session, and per agent app: the view that answers "which session
+//! holds how much?". A process belongs to the session whose tags it inherited (see `owner.rs`); a
+//! job's `VRAMORAMA_OWNER` label names the job inside its session instead of hiding the session.
 
 use std::collections::HashMap;
 
@@ -12,7 +12,7 @@ use crate::scan::Row;
 
 /// The processes of one agent session (or, for processes started outside any session, of one
 /// label, lease or untagged process).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Group {
     pub key: String,
     /// `claude 5f3c1e2a`, `chatgpt 3c4d5e6f`, a label, or `untagged python.exe 8352`.
@@ -22,42 +22,71 @@ pub struct Group {
     pub session: Option<String>,
     pub title: Option<String>,
     pub live: Option<bool>,
+    /// GPU memory, MiB.
     pub mib: u64,
-    /// Memory held by processes doing no GPU work right now.
+    /// GPU memory held by processes doing no GPU work right now.
     pub idle_mib: u64,
+    /// Processes holding GPU memory.
     pub pids: Vec<u32>,
+    /// RAM (private working set) of the session's jobs: every process carrying its tags except
+    /// the agent's own process.
+    pub ram_mib: u64,
+    /// Private bytes those processes have committed (RAM or page file).
+    pub commit_mib: u64,
+    /// Processes counted in `ram_mib`.
+    pub ram_procs: usize,
+    /// RAM of the agent's own process (Claude Code's `claude.exe`).
+    pub agent_mib: u64,
     /// Labels and leases of the jobs inside the session.
     pub jobs: Vec<String>,
 }
 
-pub fn group(rows: &[Row]) -> Vec<Group> {
+/// Group GPU rows (`Scanner::rows`) and RAM rows (`Scanner::ram_rows`) by agent session. GPU
+/// totals come only from the first, RAM totals only from the second, so a process on both lists
+/// is counted once in each.
+pub fn group(gpu: &[Row], ram: &[Row]) -> Vec<Group> {
     let mut out: Vec<Group> = Vec::new();
     let mut at: HashMap<String, usize> = HashMap::new();
-    for r in rows {
+    let mut slot = |r: &Row| -> usize {
         let (key, label) = r.session_group();
-        let i = *at.entry(key.clone()).or_insert_with(|| {
+        *at.entry(key.clone()).or_insert_with(|| {
             out.push(Group {
-                key: key.clone(),
+                key,
                 label,
                 harness: r.owner.harness(),
                 app: r.owner.app(),
                 session: r.owner.session().map(str::to_string),
-                title: r.title.clone(),
-                live: r.harness_live,
-                mib: 0,
-                idle_mib: 0,
-                pids: Vec::new(),
-                jobs: Vec::new(),
+                ..Default::default()
             });
             out.len() - 1
-        });
+        })
+    };
+    let mut seen: Vec<(usize, &Row)> = Vec::new();
+    for r in gpu {
+        seen.push((slot(r), r));
+    }
+    let gpu_n = seen.len();
+    for r in ram {
+        seen.push((slot(r), r));
+    }
+    for (n, (i, r)) in seen.into_iter().enumerate() {
         let g = &mut out[i];
-        g.mib += r.mib;
-        if r.util.is_some_and(|u| u < IDLE_UTIL) {
-            g.idle_mib += r.mib;
-        }
-        if !g.pids.contains(&r.pid) {
-            g.pids.push(r.pid);
+        if n < gpu_n {
+            g.mib += r.mib;
+            if r.util.is_some_and(|u| u < IDLE_UTIL) {
+                g.idle_mib += r.mib;
+            }
+            if !g.pids.contains(&r.pid) {
+                g.pids.push(r.pid);
+            }
+        } else if let Some(m) = r.ram {
+            if r.agent_proc {
+                g.agent_mib += m.private_mib;
+            } else {
+                g.ram_mib += m.private_mib;
+                g.commit_mib += m.commit_mib;
+                g.ram_procs += 1;
+            }
         }
         // A session is live while any of its harness processes is.
         g.live = match (g.live, r.harness_live) {
@@ -78,7 +107,12 @@ pub fn group(rows: &[Row]) -> Vec<Group> {
             g.jobs.push(j);
         }
     }
-    out.sort_by(|a, b| b.mib.cmp(&a.mib).then_with(|| a.key.cmp(&b.key)));
+    out.sort_by(|a, b| {
+        b.mib
+            .cmp(&a.mib)
+            .then((b.ram_mib + b.agent_mib).cmp(&(a.ram_mib + a.agent_mib)))
+            .then_with(|| a.key.cmp(&b.key))
+    });
     out
 }
 
@@ -94,6 +128,10 @@ pub fn group_json(g: &Group) -> Value {
         ("mib", g.mib.into()),
         ("idle_mib", g.idle_mib.into()),
         ("pids", Value::Arr(g.pids.iter().map(|&p| p.into()).collect())),
+        ("ram_mib", g.ram_mib.into()),
+        ("commit_mib", g.commit_mib.into()),
+        ("ram_procs", (g.ram_procs as u64).into()),
+        ("agent_mib", g.agent_mib.into()),
         ("jobs", Value::Arr(g.jobs.iter().map(|j| j.as_str().into()).collect())),
     ])
 }
@@ -105,8 +143,14 @@ pub struct App {
     pub harness: Option<&'static str>,
     /// Whether the app (or for Cowork, its VM service) is running; `None` when not checked.
     pub running: Option<bool>,
+    /// Sessions with any process: on the GPU, or in RAM.
     pub sessions: usize,
+    /// Sessions holding GPU memory.
+    pub gpu_sessions: usize,
     pub mib: u64,
+    /// RAM of the sessions' jobs, and of the agents' own processes.
+    pub ram_mib: u64,
+    pub agent_mib: u64,
     pub note: Option<&'static str>,
 }
 
@@ -116,9 +160,16 @@ const COWORK_NOTE: &str = "Cowork sessions run in a virtual machine with no GPU 
 /// sessions are listed when they are running, so "the ChatGPT app holds nothing" is visible.
 pub fn apps(groups: &[Group], table: &HashMap<u32, Entry>) -> Vec<App> {
     let running = |exe: &str| table.values().any(|e| e.exe.eq_ignore_ascii_case(exe));
-    let sum = |name: &str| {
-        let mine: Vec<&Group> = groups.iter().filter(|g| g.app == Some(name)).collect();
-        (mine.len(), mine.iter().map(|g| g.mib).sum::<u64>())
+    let total = |name: &'static str, harness: Option<&'static str>, mine: &[&Group], running, note| App {
+        name,
+        harness,
+        running,
+        sessions: mine.len(),
+        gpu_sessions: mine.iter().filter(|g| g.mib > 0).count(),
+        mib: mine.iter().map(|g| g.mib).sum(),
+        ram_mib: mine.iter().map(|g| g.ram_mib).sum(),
+        agent_mib: mine.iter().map(|g| g.agent_mib).sum(),
+        note,
     };
     let mut out = Vec::new();
     for (name, harness, exe, note) in [
@@ -127,24 +178,17 @@ pub fn apps(groups: &[Group], table: &HashMap<u32, Entry>) -> Vec<App> {
         ("ChatGPT (Codex)", "codex", "chatgpt.exe", None),
         ("Codex CLI", "codex", "codex.exe", None),
     ] {
-        let (sessions, mib) = sum(name);
+        let mine: Vec<&Group> = groups.iter().filter(|g| g.app == Some(name)).collect();
         let up = running(exe);
         // codex.exe also runs inside the ChatGPT app; list the CLI only when it has sessions.
-        if sessions == 0 && (!up || name == "Codex CLI") {
+        if mine.is_empty() && (!up || name == "Codex CLI") {
             continue;
         }
-        out.push(App { name, harness: Some(harness), running: Some(up), sessions, mib, note });
+        out.push(total(name, Some(harness), &mine, Some(up), note));
     }
     let other: Vec<&Group> = groups.iter().filter(|g| g.app.is_none()).collect();
     if !other.is_empty() {
-        out.push(App {
-            name: "Outside agent sessions",
-            harness: None,
-            running: None,
-            sessions: other.len(),
-            mib: other.iter().map(|g| g.mib).sum(),
-            note: None,
-        });
+        out.push(total("Outside agent sessions", None, &other, None, None));
     }
     out
 }
@@ -155,7 +199,10 @@ pub fn app_json(a: &App) -> Value {
         ("harness", a.harness.into()),
         ("running", a.running.into()),
         ("sessions", (a.sessions as u64).into()),
+        ("gpu_sessions", (a.gpu_sessions as u64).into()),
         ("mib", a.mib.into()),
+        ("ram_mib", a.ram_mib.into()),
+        ("agent_mib", a.agent_mib.into()),
         ("note", a.note.into()),
     ])
 }
@@ -164,6 +211,7 @@ pub fn app_json(a: &App) -> Value {
 mod tests {
     use super::*;
     use crate::owner::Owner;
+    use crate::scan::Ram;
 
     fn row(pid: u32, mib: u64, util: f64, owner: Owner, live: Option<bool>) -> Row {
         Row {
@@ -181,7 +229,16 @@ mod tests {
             harness_live: live,
             root: None,
             note: None,
+            ram: None,
+            agent_proc: false,
         }
+    }
+
+    fn ram_row(pid: u32, private_mib: u64, owner: Owner, agent: bool) -> Row {
+        let mut r = row(pid, 0, 0.0, owner, Some(true));
+        (r.luid, r.util, r.agent_proc) = (0, None, agent);
+        r.ram = Some(Ram { private_mib, ws_mib: private_mib, peak_ws_mib: private_mib, commit_mib: private_mib * 2 });
+        r
     }
 
     fn claude(id: &str) -> Owner {
@@ -207,7 +264,7 @@ mod tests {
             row(30, 60, 0.0, Owner::default(), None),
             row(40, 100, 0.0, Owner { label: Some("eval-server".into()), ..Default::default() }, None),
         ];
-        let g = group(&rows);
+        let g = group(&rows, &[]);
         assert_eq!(
             g.iter().map(|g| g.key.as_str()).collect::<Vec<_>>(),
             ["claude:a91d07c4", "codex:3c4d5e6f", "eval-server", "untagged python.exe 30"]
@@ -234,5 +291,47 @@ mod tests {
         assert_eq!((a[3].sessions, a[3].mib), (2, 160));
         // Nothing running and nothing held: the app is not listed.
         assert!(apps(&g[2..], &HashMap::new()).iter().all(|a| a.harness.is_none()));
+    }
+
+    #[test]
+    fn resumed_sessions_keep_their_jobs_live_and_system_processes_get_names() {
+        let id = "a91d07c4-2b3e-4f5a-8c9d-0e1f2a3b4c5d";
+        // A job started by an earlier claude.exe of the session, and the claude.exe now running it.
+        let mut rows = vec![ram_row(10, 700, claude(id), false), ram_row(2, 200, claude(id), true)];
+        rows[0].harness_live = Some(false);
+        let other = Owner { claude: Some("ffffffff-0000-4000-8000-000000000000".into()), ..Default::default() };
+        rows.push(ram_row(11, 300, other, false));
+        rows[2].harness_live = Some(false);
+        let live = crate::scan::live_agent_sessions(&rows);
+        crate::scan::revive(&mut rows, &live);
+        assert_eq!(rows[0].harness_live, Some(true), "its session runs on in another claude.exe");
+        assert_eq!(rows[2].harness_live, Some(false), "a session with no Claude Code process stays ended");
+        let mut wsl = ram_row(33680, 4000, Owner::default(), false);
+        wsl.name = "vmmemWSL".into();
+        assert_eq!(wsl.session_group(), ("untagged vmmemWSL 33680".to_string(), "WSL 2 virtual machine".to_string()));
+    }
+
+    #[test]
+    fn ram_counts_jobs_and_the_agent_apart() {
+        let id = "a91d07c4-2b3e-4f5a-8c9d-0e1f2a3b4c5d";
+        let mut job = claude(id);
+        job.label = Some("tokenize".into());
+        // The training job holds GPU memory and RAM; its data loader and the agent only RAM.
+        let gpu = vec![row(10, 9000, 95.0, claude(id), Some(true))];
+        let ram = vec![
+            ram_row(10, 3000, claude(id), false),
+            ram_row(11, 2000, job, false),
+            ram_row(1, 500, claude(id), true),
+            ram_row(50, 4000, Owner::default(), false),
+        ];
+        let g = group(&gpu, &ram);
+        assert_eq!(g.iter().map(|g| g.key.as_str()).collect::<Vec<_>>(), ["claude:a91d07c4", "untagged python.exe 50"]);
+        let s = &g[0];
+        assert_eq!((s.mib, s.pids.len()), (9000, 1), "the GPU side is unchanged by RAM rows");
+        assert_eq!((s.ram_mib, s.commit_mib, s.ram_procs, s.agent_mib), (5000, 10000, 2, 500));
+        assert_eq!(s.jobs, ["tokenize"]);
+        let a = apps(&g, &HashMap::new());
+        assert_eq!((a[0].name, a[0].ram_mib, a[0].agent_mib, a[0].gpu_sessions), ("Claude Code", 5000, 500, 1));
+        assert_eq!((a[1].name, a[1].ram_mib, a[1].gpu_sessions), ("Outside agent sessions", 4000, 0));
     }
 }

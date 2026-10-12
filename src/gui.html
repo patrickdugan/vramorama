@@ -278,6 +278,11 @@ let range = Number(store("vramorama.range") || 900);
 let group = store("vramorama.group") === "job" ? "job" : "session";
 // Processes table filter: { by: "session" | "job", key }.
 let filter = null;
+// What the timeline plots: GPU memory or RAM.
+let metric = store("vramorama.metric") === "ram" ? "ram" : "vram";
+// A session is listed (and gets its own color in the RAM bar) from this much RAM up.
+const SESSION_MIN_RAM = 256;
+const ramOf = s => (s.ram_mib || 0) + (s.agent_mib || 0);
 
 const keyOf = p => group === "session" ? p.group_key : p.owner_key;
 const groupList = () => (group === "session" ? now.sessions : now.owners) || [];
@@ -333,15 +338,19 @@ function render() {
   // Groups on the card now or on the visible timeline keep their colors; the rest free theirs.
   inUse = new Set();
   for (const a of now.adapters) for (const p of a.procs) inUse.add(keyOf(p));
-  for (const p of points) if (p.ts >= now.ts - range) for (const k of Object.keys(pointMap(p))) inUse.add(k);
+  for (const k of ramGroups().map(g => g.key)) inUse.add(k);
+  for (const p of points) if (p.ts >= now.ts - range) for (const k of Object.keys(metric === "ram" ? p.r || {} : pointMap(p))) inUse.add(k);
   releaseSlots();
-  if (filter && !now.adapters.some(a => a.procs.some(p => (filter.by === "session" ? p.group_key : p.owner_key) === filter.key))) filter = null;
+  const allProcs = [...now.adapters.flatMap(a => a.procs), ...(now.ram_procs || [])];
+  if (filter && !allProcs.some(p => (filter.by === "session" ? p.group_key : p.owner_key) === filter.key)) filter = null;
   app.replaceChildren(
     header(),
     ...now.adapters.map(adapterCard),
+    memoryCard(),
     sessionsCard(),
     timelineCard(),
     procsCard(),
+    ramProcsCard(),
     el("div", { class: "grid2" }, watermarkCard(), leasesCard()),
     el("footer", {}, `vramorama ${now.version || ""} · read-only: it shows who holds the GPU and never stops a process · served on 127.0.0.1`)
   );
@@ -427,8 +436,69 @@ function adapterCard(a) {
       elsewhere > 0 ? el("span", { class: "item" }, el("span", { class: "sw", style: "background:var(--elsewhere)" }), "Elsewhere", el("b", { text: fmt(elsewhere) })) : null,
       el("span", { class: "item" }, el("span", { class: "sw", style: "background:var(--track)" }), "Free", el("b", { text: fmt(Math.max(0, total - a.used_mib)) }))));
 }
-function tile(label, value, unit) {
-  return el("div", { class: "tile" }, el("div", { class: "label", text: label }), el("div", { class: "value" }, fmt(value), el("small", { text: unit })));
+function tile(label, value, unit, sub) {
+  return el("div", { class: "tile" }, el("div", { class: "label", text: label }), el("div", { class: "value" }, fmt(value), el("small", { text: unit }), sub ? el("small", { text: sub }) : null));
+}
+
+// ---------- system memory: RAM by agent session ----------
+/** RAM per group in the current grouping, largest first: each session's total (its jobs plus the
+ * agent's own process), or per job from the RAM process list. */
+function ramGroups() {
+  if (!now.memory) return [];
+  if (group === "session") {
+    return (now.sessions || []).filter(s => ramOf(s) >= SESSION_MIN_RAM)
+      .map(s => ({ key: s.key, label: s.title || s.label, sub: s.app ? `${s.app} · ${s.label} · jobs ${fmt(s.ram_mib)} + agent ${fmt(s.agent_mib)} MiB` : null, mib: ramOf(s) }))
+      .sort((a, b) => b.mib - a.mib);
+  }
+  const m = new Map();
+  for (const p of now.ram_procs || []) {
+    const o = m.get(p.owner_key) || { key: p.owner_key, label: nameOf(p.owner_key), mib: 0 };
+    o.mib += p.ram_mib || 0; m.set(p.owner_key, o);
+  }
+  return [...m.values()].filter(o => o.mib >= SESSION_MIN_RAM).sort((a, b) => b.mib - a.mib);
+}
+
+function memoryCard() {
+  const m = now.memory;
+  if (!m) return null;
+  const groups = ramGroups();
+  const total = Math.max(m.total_mib, 1);
+  const rest = Math.max(0, m.used_mib - groups.reduce((s, g) => s + g.mib, 0));
+  const tip = el("div", { class: "tip", hidden: true });
+  const seg = (cls, color, mib, label, sub) => {
+    const d = el("div", { class: cls, style: `flex: 0 0 ${(mib / total) * 100}%;` + (color ? `background:${color}` : "") });
+    d.addEventListener("mousemove", ev => {
+      tip.hidden = false;
+      tip.replaceChildren(el("div", { class: "row" }, color ? el("span", { class: "sw", style: `background:${color}` }) : null, el("span", { class: "l", text: label }), el("span", { class: "n", text: fmt(mib) + " MiB" })),
+        el("div", { class: "t", text: (sub ? sub + " · " : "") + `${((mib / total) * 100).toFixed(1)}% of RAM` }));
+      const r = d.parentElement.getBoundingClientRect();
+      tip.style.left = Math.min(ev.clientX - r.left + 12, r.width - 200) + "px"; tip.style.top = "28px";
+    });
+    d.addEventListener("mouseleave", () => { tip.hidden = true; });
+    return d;
+  };
+  const segs = groups.map(g => seg("", colorOf(g.key), g.mib, g.label, g.sub));
+  if (rest > 0) segs.push(seg("elsewhere", null, rest, "Everything else", "the desktop, browsers, other apps, and smaller sessions"));
+  segs.push(el("div", { class: "free", title: `${fmt(m.available_mib)} MiB available` }));
+  const warn = [];
+  if (m.available_mib < total * 0.05) warn.push(`Only ${fmt(m.available_mib)} MiB of RAM is available. Windows is paging memory to disk, which slows every process that touches it, GPU jobs included: their data loaders and host-side buffers live here.`);
+  if (m.commit_mib > m.commit_limit_mib * 0.9) warn.push(`Committed memory is ${fmt(m.commit_mib)} of ${fmt(m.commit_limit_mib)} MiB; allocations start failing at the limit.`);
+  return el("section", { class: "card", "aria-label": "System memory" },
+    el("div", { class: "card-head" }, el("h2", { text: "System memory (RAM)" }), el("p", { class: "sub", text: `${fmt(m.total_mib)} MiB installed` })),
+    warn.map(w => el("p", { class: "spill", role: "alert", text: w })),
+    el("div", { class: "hero" },
+      el("div", {}, el("span", { class: "big", text: fmt(m.used_mib) }), el("span", { class: "of", text: `of ${fmt(m.total_mib)} MiB in use` })),
+      el("div", { class: "tiles" },
+        tile("Available", m.available_mib, "MiB"),
+        tile("Agent sessions' jobs", m.jobs_mib, "MiB"),
+        tile("The agents themselves", m.agents_mib, "MiB"),
+        tile("Committed", m.commit_mib, "MiB", ` of ${fmt(m.commit_limit_mib)}`))),
+    el("div", { class: "chart" }, el("div", { class: "bar", role: "img", "aria-label": `${fmt(m.used_mib)} of ${fmt(m.total_mib)} MiB of RAM in use` }, segs), tip),
+    el("div", { class: "legend" },
+      groups.map(g => el("span", { class: "item" }, el("span", { class: "sw", style: `background:${colorOf(g.key)}` }), el("span", { class: "trunc", text: g.label }), el("b", { text: fmt(g.mib) }))),
+      rest > 0 ? el("span", { class: "item" }, el("span", { class: "sw", style: "background:var(--elsewhere)" }), "Everything else", el("b", { text: fmt(rest) })) : null,
+      el("span", { class: "item" }, el("span", { class: "sw", style: "background:var(--track)" }), "Available", el("b", { text: fmt(m.available_mib) }))),
+    el("p", { class: "note", style: "margin:10px 0 0" }, "RAM is each process's private working set, as Task Manager's Memory column shows it. A session's RAM is its jobs (every process carrying its tags) plus the agent's own process."));
 }
 
 // ---------- agent sessions: which session holds how much, per app ----------
@@ -447,30 +517,38 @@ function toggleFilter(by, key) {
 function appTile(a) {
   const what = a.harness == null
     ? plural(a.sessions, "group", "groups") + ": labels, leases and untagged processes"
-    : plural(a.sessions, "session", "sessions") + " on the GPU" + (a.running === true ? " · running" : a.running === false ? " · not running" : "");
+    : plural(a.gpu_sessions ?? a.sessions, "session", "sessions") + " on the GPU" + (a.running === true ? " · running" : a.running === false ? " · not running" : "");
+  const ram = a.ram_mib == null ? null : a.harness
+    ? `RAM ${fmt(a.ram_mib)} MiB in jobs` + (a.agent_mib ? ` + ${fmt(a.agent_mib)} agent` : "") + ` · ${plural(a.sessions, "session", "sessions")}`
+    : `RAM ${fmt(a.ram_mib)} MiB`;
   return el("div", { class: "app", title: a.note || null },
     el("div", { class: "n" }, a.harness ? el("span", { class: "dot" + (a.running ? "" : " idle") }) : null, el("span", { class: "trunc", text: a.name })),
-    el("div", { class: "v" }, fmt(a.mib), el("small", { text: "MiB" })),
+    el("div", { class: "v" }, fmt(a.mib), el("small", { text: "MiB VRAM" })),
     el("div", { class: "s", text: what }),
-    a.note && a.sessions === 0 ? el("div", { class: "s", text: a.note }) : null);
+    ram ? el("div", { class: "s", text: ram }) : null,
+    a.note && (a.gpu_sessions ?? a.sessions) === 0 ? el("div", { class: "s", text: a.note }) : null);
 }
 
 function sessionsCard() {
   const card = el("section", { class: "card", "aria-label": "Agent sessions" },
     el("div", { class: "card-head" }, el("h2", { text: "Agent sessions" }),
-      el("p", { class: "sub", text: "GPU memory each agent session holds now. Jobs with a label or a lease count against the session that started them. Click a session to see its processes." })));
+      el("p", { class: "sub", text: "GPU memory and RAM each agent session holds now. Jobs with a label or a lease count against the session that started them. Click a session to see its processes." })));
   const apps = now.apps || [];
   if (apps.length) card.append(el("div", { class: "apps" }, apps.map(appTile)));
-  const live = (now.sessions || []).filter(s => s.now_mib > 0);
-  if (!live.length) { card.append(el("p", { class: "note", text: "No process holds GPU memory above the threshold." })); return card; }
+  const all = now.sessions || [];
+  const live = all.filter(s => s.now_mib > 0 || ramOf(s) >= SESSION_MIN_RAM)
+    .sort((a, b) => b.now_mib - a.now_mib || ramOf(b) - ramOf(a));
+  if (!live.length) { card.append(el("p", { class: "note", text: "No session holds GPU memory or RAM above the thresholds." })); return card; }
   const total = Math.max(1, now.adapters.reduce((s, a) => s + a.total_mib, 0));
-  const head = el("tr", {}, ["Session", "State", "VRAM MiB", "Peak", "GiB·h", "Idle GiB·h", "Jobs"].map((h, i) =>
-    el("th", { class: [2, 3, 4, 5].includes(i) ? "num" : "", scope: "col", text: h })));
+  const ramTotal = Math.max(1, now.memory ? now.memory.total_mib : 1);
+  const head = el("tr", {}, ["Session", "State", "VRAM MiB", "Peak", "GiB·h", "Idle GiB·h", "RAM MiB", "RAM peak", "Jobs"].map((h, i) =>
+    el("th", { class: [2, 3, 4, 5, 6, 7].includes(i) ? "num" : "", scope: "col", text: h })));
   const body = live.map(s => {
     const color = group === "session" ? colorOf(s.key) : "var(--other)";
     const sel = filter && filter.by === "session" && filter.key === s.key;
-    const n = (s.pids || []).length;
+    const n = Math.max(s.ram_procs || 0, (s.pids || []).length);
     const sub = [s.title ? s.label : null, n ? plural(n, "process", "processes") : null].filter(Boolean).join(" · ");
+    const ram = ramOf(s);
     return el("tr", { class: sel ? "sel" : null },
       el("td", {}, el("div", { class: "sess" }, el("span", { class: "sw", style: `background:${color}` }),
         el("div", {},
@@ -479,30 +557,42 @@ function sessionsCard() {
             pill(s.app)),
           sub ? el("div", { class: "id trunc", text: sub }) : null))),
       el("td", {}, stateChip(s.live)),
-      el("td", { class: "num" }, fmt(s.now_mib), el("span", { class: "minibar", title: `${((s.now_mib / total) * 100).toFixed(0)}% of the card` }, el("i", { style: `width:${Math.min(100, (s.now_mib / total) * 100)}%;background:${color}` }))),
-      el("td", { class: "num", title: "at " + clock(s.peak_ts), text: fmt(s.peak_mib) }),
-      el("td", { class: "num", text: s.gib_hours.toFixed(2) }),
-      el("td", { class: "num", text: s.idle_gib_hours.toFixed(2) }),
+      el("td", { class: "num" }, s.now_mib ? fmt(s.now_mib) : "–", el("span", { class: "minibar", title: `${((s.now_mib / total) * 100).toFixed(0)}% of the card` }, el("i", { style: `width:${Math.min(100, (s.now_mib / total) * 100)}%;background:${color}` }))),
+      el("td", { class: "num", title: s.peak_mib ? "at " + clock(s.peak_ts) : null, text: s.peak_mib ? fmt(s.peak_mib) : "–" }),
+      el("td", { class: "num", text: s.peak_mib ? s.gib_hours.toFixed(2) : "–" }),
+      el("td", { class: "num", text: s.peak_mib ? s.idle_gib_hours.toFixed(2) : "–" }),
+      el("td", { class: "num", title: `jobs ${fmt(s.ram_mib || 0)} MiB in ${plural(s.ram_procs || 0, "process", "processes")} + the agent's own process ${fmt(s.agent_mib || 0)} MiB; committed ${fmt(s.commit_mib || 0)} MiB` },
+        ram ? fmt(ram) : "–", el("span", { class: "minibar" }, el("i", { style: `width:${Math.min(100, (ram / ramTotal) * 100)}%;background:${color}` }))),
+      el("td", { class: "num", text: s.ram_peak_mib ? fmt(s.ram_peak_mib) : "–" }),
       el("td", {}, (s.jobs || []).length ? el("div", { class: "jobs" }, s.jobs.map(j => el("span", { class: "job", title: j, text: j }))) : el("span", { class: "note", text: "–" })));
   });
   card.append(el("div", { class: "tablewrap" }, el("table", {}, el("thead", {}, head), el("tbody", {}, body))));
+  const quiet = all.filter(s => !s.now_mib && ramOf(s) > 0 && ramOf(s) < SESSION_MIN_RAM);
+  if (quiet.length) card.append(el("p", { class: "note", style: "margin:10px 0 0", text: `and ${plural(quiet.length, "more session", "more sessions")} with no GPU memory and under ${SESSION_MIN_RAM} MiB of RAM each (${fmt(quiet.reduce((n, s) => n + ramOf(s), 0))} MiB in all).` }));
   return card;
 }
 
 // ---------- timeline: in use (wash) + one 2px line per group, one axis in MiB ----------
 function timelineCard() {
+  const ram = metric === "ram" && now.memory;
+  const metricBtn = (m, label) => el("button", { type: "button", "data-fk": "metric-" + m, "aria-pressed": String(metric === m), onclick: () => { metric = m; store("vramorama.metric", m); render(); } }, label);
+  const what = ram ? "session" : group === "session" ? "session" : "job";
   const card = el("section", { class: "card" },
-    el("div", { class: "card-head" }, el("h2", { text: group === "session" ? "VRAM by agent session" : "VRAM by job" }),
-      el("p", { class: "sub", text: `MiB over the last ${range >= 3600 ? "hour" : range / 60 + " minutes"} · shaded: all memory in use · lines: each ${group === "session" ? "session" : "job"} · top of the axis: the card's capacity` })));
+    el("div", { class: "card-head" }, el("h2", { text: `${ram ? "RAM" : "VRAM"} by ${ram || group === "session" ? "agent session" : "job"}` }),
+      now.memory ? el("div", { class: "seg", role: "group", "aria-label": "Timeline shows" }, metricBtn("vram", "VRAM"), metricBtn("ram", "RAM")) : null,
+      el("p", { class: "sub", text: `MiB over the last ${range >= 3600 ? "hour" : range / 60 + " minutes"} · shaded: all ${ram ? "RAM" : "memory"} in use · lines: each ${what}${ram ? " (its jobs plus its agent)" : ""} · top of the axis: ${ram ? "installed RAM" : "the card's capacity"}` })));
   const box = el("div", { class: "chart" });
   card.append(box);
   const t1 = now.ts, t0 = t1 - range;
-  const pts = points.filter(p => p.ts >= t0);
+  const view = ram
+    ? { map: p => p.r || {}, used: p => p.ru || 0, cap: now.memory.total_mib, name: k => { const s = sessionInfo(k); return s ? (s.title || s.label) : k; } }
+    : { map: pointMap, used: p => p.used, cap: now.adapters.reduce((s, a) => s + a.total_mib, 0), name: nameOf };
+  const pts = points.filter(p => p.ts >= t0 && (!ram || p.ru != null));
   if (pts.length < 2) { box.append(el("div", { class: "empty", text: "Collecting samples… the timeline fills in as vramorama watches." })); return card; }
   const keys = [];
-  for (const p of pts) for (const k of Object.keys(pointMap(p))) if (!keys.includes(k)) keys.push(k);
-  const labelOf = new Map(keys.map(k => [k, nameOf(k)]));
-  drawTimeline(box, pts, keys, labelOf, t0, t1);
+  for (const p of pts) for (const k of Object.keys(view.map(p))) if (!keys.includes(k)) keys.push(k);
+  const labelOf = new Map(keys.map(k => [k, view.name(k)]));
+  drawTimeline(box, pts, keys, labelOf, t0, t1, view);
   card.append(el("div", { class: "legend" },
     el("span", { class: "item" }, el("span", { class: "sw", style: "background:var(--wash);outline:1px solid var(--axis)" }), "All memory in use"),
     keys.map(k => el("span", { class: "item" }, el("span", { class: "sw line", style: `background:${colorOf(k)}` }), el("span", { class: "trunc", text: labelOf.get(k) || k })))));
@@ -522,9 +612,10 @@ function cardInnerWidth() {
   return app.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - 42;
 }
 
-function drawTimeline(box, pts, keys, labelOf, t0, t1) {
+function drawTimeline(box, pts, keys, labelOf, t0, t1, view) {
+  const pointMap = view.map;
   const W = Math.max(cardInnerWidth(), 280), H = 220, padL = 52, padR = keys.length <= 4 ? 120 : 12, padT = 8, padB = 24;
-  const cap = Math.max(now.adapters.reduce((s, a) => s + a.total_mib, 0), ...pts.map(p => p.used), 1);
+  const cap = Math.max(view.cap, ...pts.map(view.used), 1);
   // The top of the axis is the card's capacity, so how full the card is reads directly.
   const step = niceStep(cap);
   const top = cap;
@@ -543,7 +634,7 @@ function drawTimeline(box, pts, keys, labelOf, t0, t1) {
   svg.append(axis);
   // In use: a neutral wash.
   let area = `M${x(pts[0].ts)},${y(0)}`;
-  for (const p of pts) area += `L${x(p.ts)},${y(p.used)}`;
+  for (const p of pts) area += `L${x(p.ts)},${y(view.used(p))}`;
   area += `L${x(pts[pts.length - 1].ts)},${y(0)}Z`;
   svg.append(sv("path", { d: area, fill: "var(--wash)" }));
   // One line per group; a missing sample breaks the line instead of drawing a fake drop.
@@ -593,7 +684,7 @@ function drawTimeline(box, pts, keys, labelOf, t0, t1) {
     dots.setAttribute("visibility", "visible");
     const rows = keys.filter(k => bm[k] != null).sort((a, b) => bm[b] - bm[a]);
     tip.replaceChildren(el("div", { class: "t", text: clock(best.ts) }),
-      el("div", { class: "row" }, el("span", { class: "sw", style: "background:var(--wash);outline:1px solid var(--axis)" }), el("span", { class: "l", text: "All in use" }), el("span", { class: "n", text: fmt(best.used) })),
+      el("div", { class: "row" }, el("span", { class: "sw", style: "background:var(--wash);outline:1px solid var(--axis)" }), el("span", { class: "l", text: "All in use" }), el("span", { class: "n", text: fmt(view.used(best)) })),
       rows.map(k => el("div", { class: "row" }, el("span", { class: "sw", style: `background:${colorOf(k)}` }), el("span", { class: "l", text: labelOf.get(k) || k }), el("span", { class: "n", text: fmt(bm[k]) }))));
     tip.hidden = false;
     const px = x(best.ts) * (r.width / W);
@@ -609,7 +700,8 @@ function drawTimeline(box, pts, keys, labelOf, t0, t1) {
 
 // ---------- processes: the table view of everything above ----------
 function ownerCell(p) {
-  const live = p.harness_live === true ? el("span", { class: "badge", text: "session live" }) : p.harness_live === false ? el("span", { class: "badge", text: "session ended" }) : null;
+  const live = p.agent_proc ? el("span", { class: "badge", title: "The agent's own process (Claude Code), not a job it started", text: "the agent itself" })
+    : p.harness_live === true ? el("span", { class: "badge", text: "session live" }) : p.harness_live === false ? el("span", { class: "badge", text: "session ended" }) : null;
   const name = p.app ? (p.title || p.group_label) : p.label ? p.label : p.owner_text;
   const detail = [p.app && p.title ? p.group_label : null, p.app && p.label ? "job " + p.label : null, p.lease ? "lease " + p.lease : null].filter(Boolean).join(" · ");
   return el("div", { class: "owner" }, el("span", { class: "sw", style: `background:${colorOf(keyOf(p))}` }),
@@ -634,8 +726,8 @@ function procsCard() {
       el("button", { type: "button", class: "iconbtn", "data-fk": "clear-filter", onclick: () => { filter = null; render(); } }, "Show all")));
   }
   if (!rows.length) { card.append(el("p", { class: "note", text: "No process holds GPU memory above the threshold." })); return card; }
-  const head = el("tr", {}, ["Owner", "PID", "VRAM MiB", "Peak", "GPU %", "Status", "Started", "Command", ""].map((h, i) =>
-    el("th", { class: [1, 2, 3, 4].includes(i) ? "num" : "", scope: "col", text: h })));
+  const head = el("tr", {}, ["Owner", "PID", "VRAM MiB", "Peak", "GPU %", "RAM MiB", "Status", "Started", "Command", ""].map((h, i) =>
+    el("th", { class: [1, 2, 3, 4, 5].includes(i) ? "num" : "", scope: "col", text: h })));
   const body = rows.map(({ a, p }) => {
     const color = colorOf(keyOf(p));
     const status = p.verdict === "stale"
@@ -652,6 +744,7 @@ function procsCard() {
       el("td", { class: "num" }, fmt(p.mib), el("span", { class: "minibar", "aria-hidden": "true" }, el("i", { style: `width:${Math.min(100, (p.mib / Math.max(a.total_mib, 1)) * 100)}%;background:${color}` }))),
       el("td", { class: "num", text: fmt(p.peak_mib) }),
       el("td", { class: "num", text: p.util == null ? "–" : Math.round(p.util) }),
+      el("td", { class: "num", title: p.commit_mib != null ? `committed ${fmt(p.commit_mib)} MiB` : null, text: p.ram_mib == null ? "–" : fmt(p.ram_mib) }),
       el("td", {}, status),
       el("td", { style: "white-space:nowrap", text: started(p.started) }),
       el("td", { class: "mono trunc", title: p.cmd || p.command_text, text: p.command_text }),
@@ -661,23 +754,65 @@ function procsCard() {
   return card;
 }
 
+/** Processes holding RAM: every process in an agent session, the agents' own processes, and
+ * untagged processes of 1 GiB or more (the server sends those of 64 MiB and up). */
+function ramProcsCard() {
+  if (!now.memory) return null;
+  let rows = now.ram_procs || [];
+  const all = rows.length;
+  if (filter) rows = rows.filter(p => (filter.by === "session" ? p.group_key : p.owner_key) === filter.key);
+  const shown = rows.slice(0, 60);
+  const card = el("section", { class: "card", "aria-label": "Processes holding RAM" },
+    el("div", { class: "card-head" }, el("h2", { text: "Processes holding RAM" }),
+      el("p", { class: "sub", text: "Jobs of agent sessions (Python, Node, servers, shells: anything carrying a session's tags), the agents' own processes, and untagged processes of 1 GiB or more. Commit is private memory reserved in RAM or the page file." })));
+  if (filter) {
+    const g = filter.by === "session" ? sessionInfo(filter.key) : (now.owners || []).find(o => o.key === filter.key);
+    card.append(el("div", { class: "filterbar" }, `Showing ${rows.length} of ${all}: `, el("b", { text: g ? (g.title || g.label) : filter.key }),
+      el("button", { type: "button", class: "iconbtn", "data-fk": "clear-filter-ram", onclick: () => { filter = null; render(); } }, "Show all")));
+  }
+  if (!shown.length) { card.append(el("p", { class: "note", text: "No process here holds 64 MiB of RAM or more." })); return card; }
+  const total = Math.max(1, now.memory.total_mib);
+  const head = el("tr", {}, ["Owner", "PID", "RAM MiB", "Commit", "VRAM", "Started", "Command", ""].map((h, i) =>
+    el("th", { class: [1, 2, 3, 4].includes(i) ? "num" : "", scope: "col", text: h })));
+  const body = shown.map(p => {
+    const actions = el("div", { class: "actions" });
+    if (!p.session && !p.label && !p.note && !p.agent_proc) actions.append(el("button", { type: "button", "data-fk": "rtrace-" + p.pid, onclick: () => openTrace(p.pid), title: "Search agent transcripts for the session that launched it" }, "Trace"));
+    return el("tr", {},
+      el("td", {}, ownerCell(p)),
+      el("td", { class: "num", text: p.pid }),
+      el("td", { class: "num", title: `working set ${fmt(p.ws_mib || 0)} MiB, including pages shared with other processes` }, fmt(p.ram_mib || 0),
+        el("span", { class: "minibar", "aria-hidden": "true" }, el("i", { style: `width:${Math.min(100, ((p.ram_mib || 0) / total) * 100)}%;background:${colorOf(keyOf(p))}` }))),
+      el("td", { class: "num", text: fmt(p.commit_mib || 0) }),
+      el("td", { class: "num", text: p.vram_mib ? fmt(p.vram_mib) : "–" }),
+      el("td", { style: "white-space:nowrap", text: started(p.started) }),
+      el("td", { class: "mono trunc", title: p.cmd || p.command_text, text: p.command_text }),
+      el("td", {}, actions));
+  });
+  card.append(el("div", { class: "tablewrap" }, el("table", {}, el("thead", {}, head), el("tbody", {}, body))));
+  if (rows.length > shown.length) card.append(el("p", { class: "note", style: "margin:10px 0 0", text: `and ${rows.length - shown.length} more; click a session above to see only its processes.` }));
+  return card;
+}
+
 function watermarkCard() {
   const bySession = group === "session";
-  const list = groupList();
+  // Sessions that never held GPU memory or much RAM are left out (every shell would be listed).
+  const list = groupList().filter(o => o.peak_mib > 0 || (o.ram_peak_mib || 0) >= SESSION_MIN_RAM);
   const card = el("section", { class: "card" },
     el("div", { class: "card-head" }, el("h2", { text: bySession ? "Watermark by session" : "Watermark by job" }), el("p", { class: "sub", text: "since " + hhmm(now.started) })));
   if (!list.length) { card.append(el("p", { class: "note", text: "Nothing has held GPU memory yet." })); return card; }
-  const head = el("tr", {}, [bySession ? "Session" : "Job", "Now", "Peak", "GiB·h", "Idle GiB·h"].map((h, i) => el("th", { class: i ? "num" : "", scope: "col", text: h })));
+  const cols = [bySession ? "Session" : "Job", "VRAM now", "Peak", "GiB·h", "Idle GiB·h"].concat(bySession && now.memory ? ["RAM now", "RAM peak"] : []);
+  const head = el("tr", {}, cols.map((h, i) => el("th", { class: i ? "num" : "", scope: "col", text: h })));
   const body = list.map(o => el("tr", { class: filter && filter.key === o.key ? "sel" : null },
     el("td", {}, el("div", { class: "owner", style: "min-width:160px" }, el("span", { class: "sw", style: `background:${colorOf(o.key)}` }),
       el("div", { class: "trunc" },
-        o.now_mib ? el("button", { type: "button", class: "link", "data-fk": "wm-" + o.key, title: "Show its processes", onclick: () => toggleFilter(bySession ? "session" : "job", o.key) }, bySession ? (o.title || o.label) : o.label)
+        o.now_mib || (bySession && ramOf(o)) ? el("button", { type: "button", class: "link", "data-fk": "wm-" + o.key, title: "Show its processes", onclick: () => toggleFilter(bySession ? "session" : "job", o.key) }, bySession ? (o.title || o.label) : o.label)
           : el("span", { text: bySession ? (o.title || o.label) : o.label }),
         bySession && o.app ? el("div", { class: "id trunc" }, o.title ? o.label + " · " : "", o.app) : null))),
     el("td", { class: "num", text: o.now_mib ? fmt(o.now_mib) : "–" }),
-    el("td", { class: "num", title: "at " + clock(o.peak_ts), text: fmt(o.peak_mib) }),
-    el("td", { class: "num", text: o.gib_hours.toFixed(2) }),
-    el("td", { class: "num", text: o.idle_gib_hours.toFixed(2) })));
+    el("td", { class: "num", title: o.peak_mib ? "at " + clock(o.peak_ts) : null, text: o.peak_mib ? fmt(o.peak_mib) : "–" }),
+    el("td", { class: "num", text: o.peak_mib ? o.gib_hours.toFixed(2) : "–" }),
+    el("td", { class: "num", text: o.peak_mib ? o.idle_gib_hours.toFixed(2) : "–" }),
+    bySession && now.memory ? [el("td", { class: "num", text: ramOf(o) ? fmt(ramOf(o)) : "–" }), el("td", { class: "num", text: o.ram_peak_mib ? fmt(o.ram_peak_mib) : "–" })] : null));
   card.append(el("div", { class: "tablewrap" }, el("table", {}, el("thead", {}, head), el("tbody", {}, body))));
   return card;
 }

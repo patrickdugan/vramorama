@@ -83,6 +83,8 @@ struct View {
     unleased_mib: u64,
     unleased_procs: usize,
     spills: Vec<(u32, u64)>,
+    /// Each process on the card: (pid, MiB), for the thrash detector.
+    procs: Vec<(u32, u64)>,
 }
 
 fn observe(sampler: &mut Sampler, scanner: &mut Scanner, card: &Card) -> View {
@@ -115,6 +117,7 @@ fn observe(sampler: &mut Sampler, scanner: &mut Scanner, card: &Card) -> View {
         unleased_mib,
         unleased_procs,
         spills: crate::scan::spills(&adapter, &sample, &rows),
+        procs: rows.iter().map(|r| (r.pid, r.mib)).collect(),
     }
 }
 
@@ -240,8 +243,17 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
     // When the request first fitted, and the committed memory (in use plus reservations) then.
     let mut fits_since: Option<(Instant, u64)> = None;
     let mut last_note = String::new();
+    let mut thrash = crate::thrash::Detector::new(60.0);
     loop {
         let view = observe(&mut sampler, &mut scanner, &card);
+        thrash.push(
+            card.luid,
+            unix_now(),
+            view.used_mib,
+            card.total_mib,
+            view.procs.iter().map(|&(p, m)| (p, m, None)),
+        );
+        let thrashing = thrash.check(card.luid);
         let waiting = {
             let _l = lock(&root)?;
             let leases = prune(&root, &view.by_lease);
@@ -259,6 +271,13 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
                     "{} MiB has spilled into system memory (pid {}); not admitting anything until it clears",
                     thousands(mib),
                     view.spills.iter().map(|(p, _)| p.to_string()).collect::<Vec<_>>().join(", ")
+                ))
+            } else if let Some(t) = &thrashing {
+                // Processes are already taking turns on the card: another job would join the queue for it.
+                fits_since = None;
+                Some(format!(
+                    "pids {} are taking turns on the full card (thrashing); not admitting anything until it stops",
+                    t.procs.iter().map(|p| p.pid.to_string()).collect::<Vec<_>>().join(" and ")
                 ))
             } else if ledger::may_admit(&me, &leases, avail) {
                 let (since, base) = *fits_since.get_or_insert_with(|| (Instant::now(), committed));

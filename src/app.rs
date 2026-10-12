@@ -63,14 +63,18 @@ pub fn watch(o: &Opts) -> Result<(), String> {
     };
     let mut idle_since: HashMap<(u32, u64), u64> = HashMap::new();
     let since = now_filetime();
+    // Enough samples to see processes take turns, at any interval.
+    let mut thrash = crate::thrash::Detector::new((12.0 * o.interval).max(60.0));
     loop {
         std::thread::sleep(Duration::from_secs_f64(o.interval));
         let sample = sampler.sample();
         let table = procs::snapshot();
         let adapters = pick_adapters(dxgi.clone(), &sample, o.all);
         let luids: Vec<u64> = adapters.iter().map(|a| a.luid).collect();
-        let rows = scanner.rows(&sample, &table, &luids, o.min_mib);
+        let mut rows = scanner.rows(&sample, &table, &luids, o.min_mib);
+        crate::scan::attach_ram(&mut rows, &procs::memory());
         let now = now_filetime();
+        feed_thrash(&mut thrash, &adapters, &sample, &rows, filetime_to_unix(now));
         for r in &rows {
             let key = (r.pid, r.luid);
             let p = peaks.entry(key).or_insert(0);
@@ -99,11 +103,139 @@ pub fn watch(o: &Opts) -> Result<(), String> {
             ));
             let view = WatchView { peaks: &peaks, idle_since: &idle_since, now };
             screen.push_str(&render(&adapters, &sample, &rows, Some(&view), width));
+            for a in &adapters {
+                if let Some(t) = thrash.check(a.luid) {
+                    screen.push_str(&format!("WARNING {}: {}\n", a.name, thrash_warning(&t, &rows)));
+                }
+            }
             screen.push_str(&render_marks(&marks, width));
             print!("{screen}");
             std::io::stdout().flush().ok();
         }
     }
+}
+
+/// Add one sample of every shown adapter to a thrash detector.
+pub fn feed_thrash(det: &mut crate::thrash::Detector, adapters: &[Adapter], sample: &Sample, rows: &[Row], ts: f64) {
+    for a in adapters {
+        let used = sample.adapter_used.get(&a.luid).copied().unwrap_or(0) / MIB;
+        let mine = rows.iter().filter(|r| r.luid == a.luid).map(|r| (r.pid, r.mib, r.ram.map(|m| m.private_mib)));
+        det.push(a.luid, ts, used, a.dedicated / MIB, mine);
+    }
+}
+
+/// A process in a thrash warning: `python.exe 25184 [lr-sweep, claude a91d07c4]`.
+pub fn thrash_name(pid: u32, rows: &[Row]) -> String {
+    let Some(r) = rows.iter().find(|r| r.pid == pid) else { return format!("pid {pid}") };
+    let mut who: Vec<String> = r.owner.label.iter().cloned().collect();
+    if r.owner.session().is_some() || who.is_empty() {
+        who.push(r.session_group().1);
+    }
+    format!("{} {pid} [{}]", r.name, who.join(", "))
+}
+
+pub fn thrash_warning(t: &crate::thrash::Thrash, rows: &[Row]) -> String {
+    crate::thrash::warning(t, |pid| thrash_name(pid, rows))
+}
+
+pub fn thrash_json(t: &crate::thrash::Thrash, rows: &[Row]) -> Value {
+    let procs = t
+        .procs
+        .iter()
+        .map(|p| {
+            let r = rows.iter().find(|r| r.pid == p.pid);
+            obj([
+                ("pid", p.pid.into()),
+                ("name", thrash_name(p.pid, rows).into()),
+                ("low_mib", p.low_mib.into()),
+                ("high_mib", p.high_mib.into()),
+                ("reversals", (p.reversals as u64).into()),
+                ("ram_antiphase", p.ram_antiphase.into()),
+                ("session_key", r.map(|r| r.session_group().0).into()),
+                ("cmd", r.and_then(|r| r.cmd.clone()).into()),
+            ])
+        })
+        .collect();
+    obj([
+        ("procs", Value::Arr(procs)),
+        ("period_secs", t.period_secs.into()),
+        ("window_secs", t.window_secs.into()),
+        ("samples", (t.samples as u64).into()),
+        ("full_share", t.full_share.into()),
+        ("warning", thrash_warning(t, rows).into()),
+    ])
+}
+
+/// `vramorama thrash`: watch the card for `window` seconds, sampling every second, and say whether
+/// processes are taking turns on it (see `thrash.rs`).
+pub fn thrash(o: &Opts, window: f64) -> Result<(), String> {
+    let mut sampler = Sampler::open()?;
+    sampler.prime();
+    let dxgi = gpu::adapters();
+    let mut scanner = Scanner::default();
+    let mut det = crate::thrash::Detector::new(window + 5.0);
+    let (mut adapters, mut rows) = (Vec::new(), Vec::new());
+    if !o.json {
+        eprintln!("vramorama: watching for {window} s...");
+    }
+    for _ in 0..(window.ceil() as u32) {
+        std::thread::sleep(Duration::from_secs(1));
+        let sample = sampler.sample();
+        let table = procs::snapshot();
+        adapters = pick_adapters(dxgi.clone(), &sample, o.all);
+        let luids: Vec<u64> = adapters.iter().map(|a| a.luid).collect();
+        rows = scanner.rows(&sample, &table, &luids, o.min_mib);
+        crate::scan::attach_ram(&mut rows, &procs::memory());
+        feed_thrash(&mut det, &adapters, &sample, &rows, filetime_to_unix(now_filetime()));
+    }
+    if o.json {
+        let list = adapters
+            .iter()
+            .map(|a| {
+                obj([
+                    ("name", a.name.as_str().into()),
+                    ("thrash", det.check(a.luid).map(|t| thrash_json(&t, &rows)).into()),
+                ])
+            })
+            .collect();
+        println!("{}", obj([("window_secs", window.into()), ("adapters", Value::Arr(list))]));
+        return Ok(());
+    }
+    let width = if o.wide { usize::MAX } else { crate::width() };
+    for a in &adapters {
+        let Some(t) = det.check(a.luid) else {
+            println!("{}: no thrash in {window} s (no two processes took turns on the card)", a.name);
+            continue;
+        };
+        println!(
+            "{}: THRASHING. {} processes took turns on the card over {:.0} s (full {:.0}% of the time){}",
+            a.name,
+            t.procs.len(),
+            t.window_secs,
+            t.full_share * 100.0,
+            t.period_secs.map(|s| format!(", a round about every {s:.0} s")).unwrap_or_default()
+        );
+        println!("{:>7} {:>17} {:>6}  {:<10}  {:<44}  COMMAND", "PID", "VRAM MiB LOW–HIGH", "TURNS", "RAM", "OWNER");
+        for p in &t.procs {
+            let Some(r) = rows.iter().find(|r| r.pid == p.pid) else { continue };
+            let line = format!(
+                "{:>7} {:>17} {:>6}  {:<10}  {:<44}  {}",
+                p.pid,
+                format!("{}–{}", thousands(p.low_mib), thousands(p.high_mib)),
+                p.reversals,
+                if p.ram_antiphase { "opposite" } else { "–" },
+                ellipsize(&owner_text(r), 44),
+                command_text(r)
+            );
+            println!("{}", ellipsize(&line, width));
+        }
+        println!(
+            "\nEach turn moves gigabytes between VRAM and system memory, so these jobs run far slower than either would\n\
+             alone. RAM \"opposite\": the process's RAM rose as its VRAM fell, where the evicted memory went. vramorama\n\
+             stops nothing; pausing or stopping one of them would let the other run at full speed."
+        );
+    }
+    Ok(())
 }
 
 /// Per-owner running watermark: current and peak total VRAM across the owner's processes.

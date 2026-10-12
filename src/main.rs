@@ -12,6 +12,7 @@ mod parse;
 mod report;
 mod sessions;
 mod spill;
+mod thrash;
 mod transcripts;
 
 #[cfg(windows)]
@@ -45,6 +46,10 @@ USAGE
   vramorama ram [--json] [--min MIB] [--wide]
       Processes of agent sessions by RAM (private working set, as Task Manager shows), with the
       agents' own processes and untagged processes of 1 GiB or more. --min defaults to 64 here.
+  vramorama thrash [--window SECS] [--json]
+      Watch the card for SECS (default 30), sampling every second, and say whether processes
+      are taking turns on it: jobs that together need more than the card has, which Windows
+      runs by swapping their memory in and out over PCIe. Nothing errors; everything crawls.
   vramorama watch [--interval SECS] [--log FILE] [--quiet] [--all] [--min MIB]
       Refresh every SECS (default 5), keeping each process's and each owner's peak
       (the running watermark). --log appends one JSON line per sample.
@@ -213,7 +218,7 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         "run" => os_run(rest),
-        "ps" | "sessions" | "ram" | "watch" | "trace" | "leases" | "idle" | "gui" => {
+        "ps" | "sessions" | "ram" | "thrash" | "watch" | "trace" | "leases" | "idle" | "gui" => {
             os_command(cmd, parse_opts(rest)?).map(|()| 0)
         }
         "reclaim" => os_reclaim(parse_opts(rest)?),
@@ -227,6 +232,13 @@ fn os_command(cmd: &str, o: Opts) -> Result<(), String> {
         "ps" => app::ps(&o),
         "sessions" => app::sessions(&o),
         "ram" => app::ram(&o),
+        "thrash" => {
+            let window = o.window.unwrap_or(30.0);
+            if window < 10.0 {
+                return Err("thrash needs a --window of at least 10 seconds".into());
+            }
+            app::thrash(&o, window)
+        }
         "watch" => app::watch(&o),
         "leases" => run::leases(o.json, o.adapter.as_deref(), o.headroom_mib),
         "gui" => gui::gui(gui::GuiOpts {

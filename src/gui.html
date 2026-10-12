@@ -402,7 +402,7 @@ function adapterCard(a) {
   const elsewhere = Math.max(0, a.used_mib - listed);
   const total = Math.max(a.total_mib, a.used_mib, 1);
   const stale = a.procs.filter(p => p.verdict === "stale");
-  const idle = a.procs.filter(p => p.verdict !== "active");
+  const idle = a.procs.filter(p => p.verdict === "idle" || p.verdict === "stale");
   const tip = el("div", { class: "tip", hidden: true });
   const seg = (cls, color, mib, label, sub) => {
     const d = el("div", { class: cls, style: `flex: 0 0 ${(mib / total) * 100}%;` + (color ? `background:${color}` : "") });
@@ -423,6 +423,10 @@ function adapterCard(a) {
   return el("section", { class: "card", "aria-label": a.name },
     el("div", { class: "card-head" }, el("h2", { text: a.name }), el("p", { class: "sub", text: `${fmt(a.total_mib)} MiB dedicated` })),
     a.spill_warning ? el("p", { class: "spill", role: "alert", text: a.spill_warning }) : null,
+    a.thrash ? el("p", { class: "spill", role: "alert" }, el("b", { text: "Thrashing. " }),
+      `${a.thrash.procs.map(t => `${t.name} (${fmt(t.low_mib)}–${fmt(t.high_mib)} MiB)`).join(" and ")} are taking turns on the full card` +
+      (a.thrash.period_secs ? `, a round about every ${Math.round(a.thrash.period_secs)} s` : "") +
+      ". Each turn moves gigabytes between VRAM and system memory, so they run far slower than either would alone. Pausing one would let the other run at full speed; vramorama stops nothing itself.") : null,
     el("div", { class: "hero" },
       el("div", {}, el("span", { class: "big", text: fmt(a.used_mib) }), el("span", { class: "of", text: `of ${fmt(a.total_mib)} MiB in use` })),
       el("div", { class: "tiles" },
@@ -730,7 +734,9 @@ function procsCard() {
     el("th", { class: [1, 2, 3, 4, 5].includes(i) ? "num" : "", scope: "col", text: h })));
   const body = rows.map(({ a, p }) => {
     const color = colorOf(keyOf(p));
-    const status = p.verdict === "stale"
+    const status = p.verdict === "thrash"
+      ? el("span", { class: "chip stale", title: p.why }, el("span", { class: "ic", text: "⇅" }), "Thrashing")
+      : p.verdict === "stale"
       ? el("span", { class: "chip stale", title: p.why }, el("span", { class: "ic", text: "▲" }), "Stale · idle " + dur(p.idle_secs))
       : p.verdict === "idle"
         ? el("span", { class: "chip idle", title: p.why || "Idle" }, el("span", { class: "ic", text: "◆" }), "Idle " + dur(p.idle_secs))

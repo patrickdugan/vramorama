@@ -225,6 +225,8 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
     let mut ram_tally = Tally::default();
     // Tags of the session that asked for each lease, looked up once per lease.
     let mut lease_owners: HashMap<String, Option<crate::owner::Owner>> = HashMap::new();
+    // A minute of samples per adapter, to see processes taking turns on a full card.
+    let mut thrash = crate::thrash::Detector::new(60.0);
     let started = filetime_to_unix(now_filetime());
     let mut last_ts: Option<f64> = None;
     loop {
@@ -242,6 +244,10 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
         let ts = filetime_to_unix(ft);
         let dt = last_ts.map_or(interval, |l| (ts - l).min(3.0 * interval));
         last_ts = Some(ts);
+        crate::app::feed_thrash(&mut thrash, &adapters, &sample, &rows, ts);
+        let thrashes: HashMap<u64, crate::thrash::Thrash> =
+            adapters.iter().filter_map(|a| thrash.check(a.luid).map(|t| (a.luid, t))).collect();
+        let thrashing = |pid: u32, luid: u64| thrashes.get(&luid).is_some_and(|t| t.procs.iter().any(|p| p.pid == pid));
 
         // Per process: peak, idle streak, verdict. Per owner and per agent session: totals.
         owners.begin();
@@ -259,6 +265,10 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
             }
             let idle_secs = idle_since.get(&key).map(|s| ts - s);
             let (verdict, why) = match idle_secs {
+                // Taking turns on the card, it waits for its memory more than it computes.
+                _ if thrashing(r.pid, r.luid) => {
+                    ("thrash", "taking turns on the full card with another process (see the warning above)".into())
+                }
                 Some(s) if s >= VERDICT_AFTER_SECS => {
                     let (v, why) = judge(r);
                     (if v == Verdict::Stale { "stale" } else { "idle" }, why)
@@ -336,6 +346,7 @@ fn sample_loop(mut sampler: Sampler, shared: &Mutex<Shared>, interval: f64, all:
                     ("total_mib", total.into()),
                     ("used_mib", used.into()),
                     ("spill_warning", crate::spill::warning(&crate::scan::spills(a, &sample, &rows)).into()),
+                    ("thrash", thrashes.get(&a.luid).map(|t| crate::app::thrash_json(t, &rows)).into()),
                     ("available_mib", (ledger::available(total, used, outstanding, HEADROOM_MIB).max(0) as u64).into()),
                     ("procs", Value::Arr(procs_json.remove(&a.luid).unwrap_or_default())),
                 ])

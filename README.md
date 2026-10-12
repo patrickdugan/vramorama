@@ -76,6 +76,7 @@ is required: no SDK headers, no import libraries beyond what Rust itself links.
 | `vramorama` / `vramorama ps` | Processes holding GPU memory now, with owner, start time, working folder and command. `--json`, `--all` (include integrated GPUs), `--min MIB` (default 16), `--wide`, `--trace` (trace every untagged process). |
 | `vramorama sessions` | GPU memory and RAM per agent session (its app, title, whether it is still running, its share of the card, its jobs' RAM and its agent's own, its processes and labelled jobs), and per agent app. Lists sessions holding GPU memory or at least `--min-ram` MiB of RAM (default 256). `--json` for agents and scripts. |
 | `vramorama ram` | Processes of agent sessions by RAM, with commit, VRAM, start time, session and command; the agents' own processes; and untagged processes of 1 GiB or more. `--min MIB` (default 64 here), `--json`. See [RAM](#ram). |
+| `vramorama thrash` | Watches the card for `--window` seconds (default 30) and says whether processes are taking turns on it, swapping their memory in and out over PCIe. See [Thrash](#thrash). `--json`. |
 | `vramorama watch` | Refreshes every `--interval` seconds (default 5) and keeps a **running watermark**: each process's peak and how long it has been idle, and each owner's current and peak total. `--log FILE` appends one JSON line per sample; `--quiet` only logs. |
 | `vramorama report FILE` | Summarises a watch log: GiB-hours (and how many of them were *idle*, held at under 1% GPU), peak, GPU% and time held per owner, or with `--by session` per agent session. Answers "what sat on the card all night?" Gaps (sleep, a stopped watcher) are capped so they do not count as use. `--json`. |
 | `vramorama trace PID` | For an untagged process: its full launch chain, and the agent transcript that typed the command. |
@@ -261,8 +262,9 @@ lease 234228b0 pid 42620 (started through WMI, outside this session)
   admission, long enough to start and load a model. After that the lease is charged only for what
   its processes hold (`leases` shows it as `holding`), so a queue runner that leased memory and
   sat empty, or a job that asked for more than it uses, does not keep memory from everyone else.
-- **Spill stops admission.** While any process on the card has spilled into system memory (see
-  [Spill](#spill)), nothing is admitted.
+- **Spill and thrash stop admission.** While any process on the card has spilled into system
+  memory (see [Spill](#spill)), or processes are taking turns on it (see [Thrash](#thrash)),
+  nothing is admitted.
 - **The lease tag.** The job runs with `VRAMORAMA_LEASE=<id>` (and `VRAMORAMA_OWNER` with
   `--owner`), inherited by everything it starts, so memory is counted against the lease through
   launcher shims and worker processes. The lease ends when the job and every process carrying the
@@ -299,6 +301,34 @@ context alone holds about 80 MiB there and pinned host buffers add some more, so
 within 1 GiB of full. `ps`, `watch`, `leases` and the GUI then print a warning naming the spilled
 processes, the JSON outputs list them under `spilled`, and `run` admits nothing until the spill clears.
 vramorama still stops nothing itself: pausing a job is your call.
+
+## Thrash
+
+Spill is one way a full card fails silently; taking turns is the other. When the jobs on a card
+together need more than it has, the WDDM video memory manager can let each run in turn: before one
+runs, the other's allocations are evicted to system memory, and they come back when it runs
+again. Each job's dedicated memory then swings by gigabytes every few seconds, opposite to the
+other's, while the card stays full, and the evicted memory shows up in their RAM. Every turn moves
+gigabytes over PCIe, so both jobs run far slower than either would alone, and nothing errors. In
+one case two training jobs swung between about 4 and 12 GB every few seconds on a 16 GB card for
+hours, while the RAM they were evicted into ran out.
+
+vramorama calls it **thrashing** when, over a window of samples, the card is within 1 GiB of full
+for at least half of them and at least two processes each swing by 1 GiB or more, change direction
+at least three times, and move opposite to each other (their changes correlate at −0.5 or less). A
+job loading its model only grows, and jobs that allocate and free memory every step do not move
+opposite to anyone; neither counts. The RAM of each process is checked too: when it rises as the
+process's VRAM falls, that is where the evicted memory went.
+
+- `vramorama thrash [--window SECS]` watches for 30 seconds (sampling every second) and names the
+  processes, their swing, how often they took turns, and their sessions.
+- `watch` and the GUI keep a minute of samples and warn as soon as it happens; the GUI marks the
+  processes **Thrashing**.
+- `run` admits nothing while the card is thrashing, as with spill.
+
+Replayed against the hour of samples a GUI had recorded during that case, the rule flagged the
+whole episode as one stretch, from the first full window until the jobs left the card, and nothing
+in the remaining 45 minutes, which included periods with the card full but steady.
 
 `leases` also says how much memory is held by processes not started through `vramorama run`. Those
 are respected but cannot be queued; when an agent starts GPU jobs directly, that line is where it

@@ -80,8 +80,8 @@ is required: no SDK headers, no import libraries beyond what Rust itself links.
 | `vramorama watch` | Refreshes every `--interval` seconds (default 5) and keeps a **running watermark**: each process's peak and how long it has been idle, and each owner's current and peak total. `--log FILE` appends one JSON line per sample; `--quiet` only logs. |
 | `vramorama report FILE` | Summarises a watch log: GiB-hours (and how many of them were *idle*, held at under 1% GPU), peak, GPU% and time held per owner, or with `--by session` per agent session. Answers "what sat on the card all night?" Gaps (sleep, a stopped watcher) are capped so they do not count as use. `--json`. |
 | `vramorama trace PID` | For an untagged process: its full launch chain, and the agent transcript that typed the command. |
-| `vramorama run --vram 9G -- CMD…` | Waits for a VRAM lease (first come, first served, with backfill), then runs `CMD` tagged with it. `--detach [--out LOG]` starts it outside the session; `--strict-fifo` turns backfill off. See [Sharing the card](#sharing-the-card-vramorama-run). |
-| `vramorama power` | Board power, the enforced power limit and the driver's default limit for each NVIDIA card, and whether the card is power-capped. `--json`. See [Power cap](#power-cap). |
+| `vramorama run --vram 9G -- CMD…` | Waits for a VRAM lease (first come, first served, with backfill), then runs `CMD` tagged with it. `--detach [--out LOG]` starts it outside the session; `--strict-fifo` turns backfill off; `--restart N`, `--guard-power SECS` and `--enforce-vram MIB` supervise the job (see [Supervised runs](#supervised-runs)). See [Sharing the card](#sharing-the-card-vramorama-run). |
+| `vramorama power` | Board power, the enforced power limit and the driver's default limit for each NVIDIA card, whether it is power-capped, and the GPU resets Windows logged in the last 24 h. `--json`. See [Power cap](#power-cap). |
 | `vramorama leases` | The lease ledger, how much a new request could get right now, memory held by processes outside any lease, and any spill. `--json`. |
 | `vramorama hook` | A Claude Code `PreToolUse` hook that stops WMI / Task Scheduler launches that would strip a job's tags. See [The agent hook](#the-agent-hook). |
 | `vramorama idle` | Processes that held memory but did no GPU work for `--window` seconds (default 20), each judged *stale* or *idle*. See [Idle holders](#idle-holders). |
@@ -329,6 +329,34 @@ lease 234228b0 pid 42620 (started through WMI, outside this session)
   processes whose lease tag is in no ledger vramorama can see are reported, since that is what a
   split queue looks like.
 
+## Supervised runs
+
+Long fine-tuning runs on a consumer GPU die for reasons that have nothing to do with the job: the card
+gets power-capped (see [Power cap](#power-cap)), a long kernel passes Windows' two-second limit and the
+driver resets the GPU (a TDR, event 153), or a neighbour's job grows past what it asked for. Three
+opt-in flags on `run` turn the lease into a small supervisor. The job stays attached to `run`, and
+vramorama only ever stops a job that `run` itself started:
+
+```powershell
+vramorama run --vram 11G --restart 5 --guard-power 30 --enforce-vram 512 -- python train.py --auto-resume
+```
+
+- `--restart N` starts the job again, up to N times, after **a GPU reset** (a `nvlddmkm` 153,
+  `amdkmdag` 4101 or `Display` 4101 event logged while the job ran, read with `wevtutil`) or a power-guard
+  stop. It waits 60 s, then until the card is no longer power-capped (an hour at most), and keeps the
+  lease meanwhile. The job must resume from its own checkpoint (`--auto-resume` here). An ordinary
+  failure, with no reset logged, is **not** retried, so a bug cannot loop; neither is a job stopped for
+  exceeding its lease.
+- `--guard-power SECS` stops the job (and its process tree) after the card has been power-capped for SECS
+  seconds. A capped card would run it twenty times slower and the next long kernel would reset the GPU
+  for everyone. With `--restart` it starts again when the cap clears.
+- `--enforce-vram MIB` stops the job when its processes hold more than the lease plus MIB. Without it a
+  job that allocates more than it asked for is not touched.
+
+A guard stop returns exit code 3. Supervision needs `run` to stay alive, so it cannot be combined with
+`--detach`; start `run` itself in the background instead. The decisions are pure functions with tests
+(`guard.rs`); `scripts/smoke.sh` checks the whole path on a real GPU.
+
 ## Spill
 
 On Windows a discrete card that is full does not fail the next allocation: the driver places it in
@@ -479,7 +507,7 @@ workflow uses no third-party actions (it checks out with plain `git`).
   the same machine. A Linux backend (NVML) is
   planned.
 - `run` schedules only the jobs started through it, and nothing in vramorama stops or kills a
-  process. Other GPU users are respected (their memory counts as in use) but not queued. The settle
+  process except, when asked with `--guard-power` or `--enforce-vram`, the job `run` itself started. Other GPU users are respected (their memory counts as in use) but not queued. The settle
   growth check protects new leases from a job that is still loading, but a job started outside
   `run` can still start on memory a lease has reserved and push the card into spill.
 - The power-cap rule is a threshold on the enforced limit (at most half the default). It reads NVIDIA

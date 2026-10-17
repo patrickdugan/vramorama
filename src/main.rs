@@ -3,6 +3,7 @@
 // Off Windows only `report` exists, so most of the shared code is unused there.
 #![cfg_attr(not(windows), allow(dead_code))]
 
+mod guard;
 mod hook;
 mod idle;
 mod json;
@@ -15,6 +16,7 @@ mod respawn;
 mod sessions;
 mod spill;
 mod supervisor;
+mod tdr;
 mod thrash;
 mod transcripts;
 
@@ -64,17 +66,26 @@ USAGE
   vramorama trace PID
       Find the agent transcript whose session launched PID (for untagged processes).
   vramorama run --vram SIZE [--owner NAME] [--detach [--out FILE]] [--wait SECS]
-                [--settle SECS] [--headroom MIB] [--adapter NAME] [--strict-fifo] [--quiet] -- COMMAND...
+                [--settle SECS] [--headroom MIB] [--adapter NAME] [--strict-fifo] [--quiet]
+                [--restart N] [--guard-power SECS] [--enforce-vram SLACK_MIB] -- COMMAND...
       Wait until SIZE (e.g. 9G, 6000M) fits on the card, first come first served, then
       run COMMAND tagged VRAMORAMA_LEASE=<id> and keep the reservation until it and its
       children exit. A small request may go ahead of a larger one that cannot start yet, if
       the larger one would still fit afterwards (--strict-fifo turns that off). Nothing is
       admitted while the card is power-capped (see `power`). --detach starts it outside this
       session (output to --out).
+      Supervised runs (opt-in, the job stays attached to this process; they only ever stop a job
+      that `run` itself started):
+        --restart N          start the job again, up to N times, after a Windows GPU reset (a TDR
+                             event logged while it ran) or a --guard-power stop; the job should
+                             resume from its own checkpoint. Other failures are not retried.
+        --guard-power SECS   stop the job if the card stays power-capped for SECS seconds.
+        --enforce-vram MIB   stop the job if it holds more than its lease plus MIB.
   vramorama power [--json] [--adapter NAME]
       Board power, the enforced power limit and the driver's default limit. A laptop GPU held
       to under half its default (a 15 W cap against 80 W) runs many times slower, and one long
-      kernel can pass Windows' 2 s limit and reset the card for every session.
+      kernel can pass Windows' 2 s limit and reset the card for every session. Also lists the GPU
+      resets Windows logged in the last 24 hours.
   vramorama leases [--json] [--headroom MIB] [--adapter NAME]
       Current leases, and how much a new request could get now.
   vramorama hook
@@ -299,6 +310,7 @@ fn os_run(args: &[String]) -> Result<i32, String> {
         adapter: None,
         quiet: false,
         strict_fifo: false,
+        policy: guard::Policy::default(),
         argv,
     };
     let mut it = flags.iter();
@@ -317,6 +329,12 @@ fn os_run(args: &[String]) -> Result<i32, String> {
             "--adapter" => o.adapter = Some(value("--adapter")?),
             "--quiet" | "-q" => o.quiet = true,
             "--strict-fifo" => o.strict_fifo = true,
+            "--restart" => o.policy.restarts = value("--restart")?.parse().map_err(|_| "--restart takes a count")?,
+            "--guard-power" => o.policy.guard_power_secs = Some(secs(value("--guard-power")?, "--guard-power")?),
+            "--enforce-vram" => {
+                o.policy.enforce_vram_slack_mib =
+                    Some(value("--enforce-vram")?.parse().map_err(|_| "--enforce-vram takes MiB of slack")?)
+            }
             s => return Err(format!("unknown run option {s}; see --help")),
         }
     }
@@ -325,6 +343,11 @@ fn os_run(args: &[String]) -> Result<i32, String> {
     }
     if o.out.is_some() && !o.detach {
         return Err("--out only applies with --detach".into());
+    }
+    if o.detach && o.policy.supervised() {
+        return Err("--restart, --guard-power and --enforce-vram need `run` to stay attached; \
+start `run` itself detached (for example with Start-Process or the agent's own background launch)"
+            .into());
     }
     run::run(&o)
 }

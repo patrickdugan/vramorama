@@ -22,6 +22,10 @@ const DETACHED_PROCESS: u32 = 0x0000_0008;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 const POLL: Duration = Duration::from_secs(2);
+/// Pause before a supervised job is started again, so a reset card can settle.
+const RESTART_COOLDOWN_SECS: u64 = 60;
+/// How long a restart waits for a power cap to clear before giving up.
+const RESTART_MAX_CAPPED: Duration = Duration::from_secs(3600);
 
 pub struct RunOpts {
     pub vram_mib: u64,
@@ -35,6 +39,8 @@ pub struct RunOpts {
     pub quiet: bool,
     /// Never let a request go ahead of an earlier one (no backfill).
     pub strict_fifo: bool,
+    /// Opt-in supervision of the job this process starts (restart, power guard, VRAM enforcement).
+    pub policy: crate::guard::Policy,
     pub argv: Vec<String>,
 }
 
@@ -371,12 +377,11 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
         );
     }
 
-    let mut cmd = Command::new(&o.argv[0]);
     let mut tags = vec![(LEASE_VAR, me.id.clone())];
     if let Some(owner) = &o.owner {
         tags.push((LABEL_VAR, owner.clone()));
     }
-    cmd.args(&o.argv[1..]).envs(tags.iter().map(|(k, v)| (*k, v.as_str())));
+    let mut cmd = job_command(o, &tags);
     let started = if o.detach {
         detach(&mut cmd, &o.argv, o.out.as_deref(), &tags)
     } else {
@@ -405,12 +410,128 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
             println!("lease {} pid {pid} ({how})", me.id);
             Ok(0)
         }
-        Started::Attached(mut child) => {
-            let status = child.wait().map_err(|e| e.to_string())?;
+        Started::Attached(child) => {
+            let code = supervise(&root, &mut me, o, &card, &tags, child, &mut sampler, &mut scanner)?;
             let _l = lock(&root)?;
             ledger::remove(&root, &me.id);
-            Ok(status.code().unwrap_or(1))
+            Ok(code)
         }
+    }
+}
+
+fn job_command(o: &RunOpts, tags: &[(&str, String)]) -> Command {
+    let mut cmd = Command::new(&o.argv[0]);
+    cmd.args(&o.argv[1..]).envs(tags.iter().map(|(k, v)| (*k, v.as_str())));
+    cmd
+}
+
+/// Stop a process and everything it started. Only ever called on a job this process launched.
+fn kill_tree(pid: u32) {
+    let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output();
+}
+
+/// Wait for the job. Unsupervised, that is all. With `--restart`, `--guard-power` or `--enforce-vram` it also
+/// watches the card every few seconds, stops the job when asked to, and starts it again after a GPU reset
+/// or a power-guard stop. Returns the exit code of the last run.
+#[allow(clippy::too_many_arguments)]
+fn supervise(
+    root: &Path,
+    me: &mut Lease,
+    o: &RunOpts,
+    card: &Card,
+    tags: &[(&str, String)],
+    mut child: Child,
+    sampler: &mut Sampler,
+    scanner: &mut Scanner,
+) -> Result<i32, String> {
+    use crate::guard::{Ended, Verdict, Watch, should_restart};
+    let policy = &o.policy;
+    if !policy.supervised() {
+        return Ok(child.wait().map_err(|e| e.to_string())?.code().unwrap_or(1));
+    }
+    let mut restarts_left = policy.restarts;
+    loop {
+        let started_at = unix_now();
+        let mut watch = Watch::default();
+        let mut stopped: Option<Ended> = None;
+        let code = loop {
+            if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
+                break st.code().unwrap_or(1);
+            }
+            let view = observe(sampler, scanner, card);
+            let capped = view.power.as_ref().is_some_and(|p| p.capped());
+            let used = view.by_lease.get(&me.id).copied().unwrap_or(0);
+            if stopped.is_none() {
+                match watch.judge(policy, unix_now(), capped, used, me.vram_mib) {
+                    Verdict::Fine => {}
+                    Verdict::StopPower { capped_for } => {
+                        eprintln!(
+                            "vramorama: lease {} stops its job: the card has been power-capped for {capped_for:.0}s",
+                            me.id
+                        );
+                        stopped = Some(Ended::PowerGuard);
+                        kill_tree(child.id());
+                    }
+                    Verdict::StopVram { used_mib, limit_mib } => {
+                        eprintln!(
+                            "vramorama: lease {} stops its job: it holds {} MiB, over its limit of {} MiB",
+                            me.id,
+                            thousands(used_mib),
+                            thousands(limit_mib)
+                        );
+                        stopped = Some(Ended::VramGuard);
+                        kill_tree(child.id());
+                    }
+                }
+            }
+            std::thread::sleep(POLL);
+        };
+        let ended = stopped.unwrap_or(Ended::Exit(code));
+        // A GPU reset logged since the job started (a little before, for clock skew).
+        let reset =
+            crate::tdr::recent_resets((unix_now() - started_at) as u64 + 120).iter().any(|t| *t >= started_at - 5.0);
+        if !should_restart(ended, reset, restarts_left) {
+            if reset && matches!(ended, Ended::Exit(c) if c != 0) {
+                eprintln!("vramorama: lease {}: the job exited with {code} after a GPU reset was logged", me.id);
+            }
+            return Ok(if stopped.is_some() { 3 } else { code });
+        }
+        restarts_left -= 1;
+        eprintln!(
+            "vramorama: lease {}: job ended ({ended:?}{}); starting it again in {RESTART_COOLDOWN_SECS}s, {restarts_left} restart(s) left",
+            me.id,
+            if reset { ", GPU reset logged" } else { "" }
+        );
+        // Keep the lease alive on this process while the job is down.
+        me.job_pid = None;
+        me.job_started = None;
+        {
+            let _l = lock(root)?;
+            ledger::write(root, me)?;
+        }
+        std::thread::sleep(Duration::from_secs(RESTART_COOLDOWN_SECS));
+        let waited = Instant::now();
+        loop {
+            let view = observe(sampler, scanner, card);
+            match view.power.as_ref().filter(|p| p.capped()) {
+                None => break,
+                Some(p) if waited.elapsed() > RESTART_MAX_CAPPED => {
+                    eprintln!(
+                        "vramorama: lease {}: still power-capped ({:.0} W) after {}; giving up",
+                        me.id,
+                        p.enforced_w,
+                        duration(waited.elapsed().as_secs_f64())
+                    );
+                    return Ok(3);
+                }
+                Some(_) => std::thread::sleep(Duration::from_secs(30)),
+            }
+        }
+        child = job_command(o, tags).spawn().map_err(|e| format!("could not restart {}: {e}", o.argv[0]))?;
+        me.job_pid = Some(child.id());
+        me.job_started = procs::created(child.id());
+        let _l = lock(root)?;
+        ledger::write(root, me)?;
     }
 }
 
@@ -497,6 +618,7 @@ pub fn power(json_out: bool, adapter: Option<&str>) -> Result<(), String> {
         println!("{}", crate::json::Value::Arr(all.iter().map(crate::power::to_json).collect()));
         return Ok(());
     }
+    let resets = crate::tdr::recent_resets(86_400);
     for p in &all {
         println!(
             "{}: drawing {:.0} W at {}% use; enforced limit {:.0} W, default limit {:.0} W: {}",
@@ -510,6 +632,16 @@ pub fn power(json_out: bool, adapter: Option<&str>) -> Result<(), String> {
         if let Some(w) = crate::power::warning(p) {
             println!("  WARNING {w}");
         }
+    }
+    if resets.is_empty() {
+        println!("GPU resets logged by Windows in the last 24 h: none");
+    } else {
+        let ago = (unix_now() - resets[0]).max(0.0);
+        println!(
+            "GPU resets logged by Windows in the last 24 h: {} (latest {} ago); a reset kills the jobs on the card",
+            resets.len(),
+            duration(ago)
+        );
     }
     Ok(())
 }

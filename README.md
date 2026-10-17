@@ -80,7 +80,8 @@ is required: no SDK headers, no import libraries beyond what Rust itself links.
 | `vramorama watch` | Refreshes every `--interval` seconds (default 5) and keeps a **running watermark**: each process's peak and how long it has been idle, and each owner's current and peak total. `--log FILE` appends one JSON line per sample; `--quiet` only logs. |
 | `vramorama report FILE` | Summarises a watch log: GiB-hours (and how many of them were *idle*, held at under 1% GPU), peak, GPU% and time held per owner, or with `--by session` per agent session. Answers "what sat on the card all night?" Gaps (sleep, a stopped watcher) are capped so they do not count as use. `--json`. |
 | `vramorama trace PID` | For an untagged process: its full launch chain, and the agent transcript that typed the command. |
-| `vramorama run --vram 9G -- CMD…` | Waits for a VRAM lease (first come, first served), then runs `CMD` tagged with it. `--detach [--out LOG]` starts it outside the session. See [Sharing the card](#sharing-the-card-vramorama-run). |
+| `vramorama run --vram 9G -- CMD…` | Waits for a VRAM lease (first come, first served, with backfill), then runs `CMD` tagged with it. `--detach [--out LOG]` starts it outside the session; `--strict-fifo` turns backfill off. See [Sharing the card](#sharing-the-card-vramorama-run). |
+| `vramorama power` | Board power, the enforced power limit and the driver's default limit for each NVIDIA card, and whether the card is power-capped. `--json`. See [Power cap](#power-cap). |
 | `vramorama leases` | The lease ledger, how much a new request could get right now, memory held by processes outside any lease, and any spill. `--json`. |
 | `vramorama hook` | A Claude Code `PreToolUse` hook that stops WMI / Task Scheduler launches that would strip a job's tags. See [The agent hook](#the-agent-hook). |
 | `vramorama idle` | Processes that held memory but did no GPU work for `--window` seconds (default 20), each judged *stale* or *idle*. See [Idle holders](#idle-holders). |
@@ -282,8 +283,15 @@ lease 234228b0 pid 42620 (started through WMI, outside this session)
   and no earlier request is still waiting. *In use* is everything on the card, leased or not, so
   jobs that do not use vramorama are still respected. *Reserved* is the part of each admitted
   lease its processes have not allocated yet (a model still loading), which is what stops the next
-  job from starting on memory the previous one is about to take. Strict first come, first served:
-  a large request at the head of the queue holds back smaller ones, so it cannot be starved.
+  job from starting on memory the previous one is about to take. First come, first served, with
+  one exception (backfill, next point).
+- **Backfill.** A large request at the head of the queue used to hold back every smaller one, so a
+  12 GiB request that could not start for six hours left 5 GiB of a 16 GiB card idle the whole time. Now a
+  smaller request may go ahead of earlier waiting ones that cannot start yet, if it fits now *and*
+  each earlier request would still fit on an otherwise empty card (total less headroom) with it
+  running. It can then delay the head only for as long as it runs, never push it out of reach.
+  An earlier request that does fit now is still served first. `run` says when it jumped the queue.
+  `--strict-fifo` restores the old rule.
 - **Settle.** The memory must stay available for `--settle` seconds (default 15) before admission,
   and the committed total (in use plus reserved) must not grow by more than 256 MiB meanwhile; if
   it does, the settle period starts again. Leased jobs filling their own reservations do not move
@@ -296,9 +304,9 @@ lease 234228b0 pid 42620 (started through WMI, outside this session)
   admission, long enough to start and load a model. After that the lease is charged only for what
   its processes hold (`leases` shows it as `holding`), so a queue runner that leased memory and
   sat empty, or a job that asked for more than it uses, does not keep memory from everyone else.
-- **Spill and thrash stop admission.** While any process on the card has spilled into system
-  memory (see [Spill](#spill)), or processes are taking turns on it (see [Thrash](#thrash)),
-  nothing is admitted.
+- **Spill, thrash and a power cap stop admission.** While any process on the card has spilled into
+  system memory (see [Spill](#spill)), processes are taking turns on it (see [Thrash](#thrash)), or
+  an NVIDIA card is power-capped (see [Power cap](#power-cap)), nothing is admitted.
 - **The lease tag.** The job runs with `VRAMORAMA_LEASE=<id>` (and `VRAMORAMA_OWNER` with
   `--owner`), inherited by everything it starts, so memory is counted against the lease through
   launcher shims and worker processes. The lease ends when the job and every process carrying the
@@ -335,6 +343,28 @@ context alone holds about 80 MiB there and pinned host buffers add some more, so
 within 1 GiB of full. `ps`, `watch`, `leases` and the GUI then print a warning naming the spilled
 processes, the JSON outputs list them under `spilled`, and `run` admits nothing until the spill clears.
 vramorama still stops nothing itself: pausing a job is your call.
+
+## Power cap
+
+A laptop GPU can be held to a fraction of its rated power. On an RTX 5080 Laptop (2026-10-15) the
+enforced limit dropped to 15 W against a default of 80 W, several times after the machine woke from
+Modern Standby, and stayed there until it was woken again. The card then draws about 19 W at 100% use and
+runs roughly twenty times slower. Worse, one long kernel can pass the two seconds Windows allows a GPU
+operation before it resets the card (a TDR, `nvlddmkm` event 153), and a reset kills the running jobs of
+every session on the card, not only the one that tipped it over. Three training runs died that way.
+
+vramorama reads board power, the enforced limit and the default limit from NVML (`nvml.dll`, shipped
+with the driver, loaded at run time like the other Windows libraries). A card counts as **capped** when
+the enforced limit is at most half the default. Clock readings are no help: under WDDM `nvidia-smi`
+shows about 200 MHz even while the card draws 100 W.
+
+```text
+> vramorama power
+NVIDIA GeForce RTX 5080 Laptop GPU: drawing 17 W at 100% use; enforced limit 15 W, default limit 80 W: CAPPED
+```
+
+`ps` and `leases` print a warning, `leases --json` has a `power` object, and `run` admits nothing
+while a card is capped. A job that is already running is not touched: vramorama stops nothing itself.
 
 ## Thrash
 
@@ -452,6 +482,8 @@ workflow uses no third-party actions (it checks out with plain `git`).
   process. Other GPU users are respected (their memory counts as in use) but not queued. The settle
   growth check protects new leases from a job that is still loading, but a job started outside
   `run` can still start on memory a lease has reserved and push the card into spill.
+- The power-cap rule is a threshold on the enforced limit (at most half the default). It reads NVIDIA
+  cards only, and it cannot tell a cap from a deliberately low limit set with `nvidia-smi -pl`.
 - The spill rule is a threshold, not a measurement of where each allocation lives: a process with
   more than 512 MiB of pinned host buffers on a nearly full card is reported as spilled too.
 - A server that waits idle between requests (an inference server between evaluation batches) is

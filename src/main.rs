@@ -9,6 +9,7 @@ mod json;
 mod ledger;
 mod owner;
 mod parse;
+mod power;
 mod report;
 mod respawn;
 mod sessions;
@@ -25,6 +26,8 @@ mod app;
 mod gpu;
 #[cfg(windows)]
 mod gui;
+#[cfg(windows)]
+mod nvml;
 #[cfg(windows)]
 mod procs;
 #[cfg(windows)]
@@ -61,10 +64,17 @@ USAGE
   vramorama trace PID
       Find the agent transcript whose session launched PID (for untagged processes).
   vramorama run --vram SIZE [--owner NAME] [--detach [--out FILE]] [--wait SECS]
-                [--settle SECS] [--headroom MIB] [--adapter NAME] [--quiet] -- COMMAND...
+                [--settle SECS] [--headroom MIB] [--adapter NAME] [--strict-fifo] [--quiet] -- COMMAND...
       Wait until SIZE (e.g. 9G, 6000M) fits on the card, first come first served, then
       run COMMAND tagged VRAMORAMA_LEASE=<id> and keep the reservation until it and its
-      children exit. --detach starts it outside this session (output to --out).
+      children exit. A small request may go ahead of a larger one that cannot start yet, if
+      the larger one would still fit afterwards (--strict-fifo turns that off). Nothing is
+      admitted while the card is power-capped (see `power`). --detach starts it outside this
+      session (output to --out).
+  vramorama power [--json] [--adapter NAME]
+      Board power, the enforced power limit and the driver's default limit. A laptop GPU held
+      to under half its default (a 15 W cap against 80 W) runs many times slower, and one long
+      kernel can pass Windows' 2 s limit and reset the card for every session.
   vramorama leases [--json] [--headroom MIB] [--adapter NAME]
       Current leases, and how much a new request could get now.
   vramorama hook
@@ -224,7 +234,7 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         "run" => os_run(rest),
-        "ps" | "sessions" | "ram" | "thrash" | "watch" | "trace" | "leases" | "idle" | "gui" => {
+        "ps" | "sessions" | "ram" | "thrash" | "watch" | "trace" | "leases" | "idle" | "gui" | "power" => {
             os_command(cmd, parse_opts(rest)?).map(|()| 0)
         }
         "reclaim" => os_reclaim(parse_opts(rest)?),
@@ -247,6 +257,7 @@ fn os_command(cmd: &str, o: Opts) -> Result<(), String> {
         }
         "watch" => app::watch(&o),
         "leases" => run::leases(o.json, o.adapter.as_deref(), o.headroom_mib),
+        "power" => run::power(o.json, o.adapter.as_deref()),
         "gui" => gui::gui(gui::GuiOpts {
             port: o.port.unwrap_or(7787),
             open: !o.no_open,
@@ -287,6 +298,7 @@ fn os_run(args: &[String]) -> Result<i32, String> {
         headroom_mib: 512,
         adapter: None,
         quiet: false,
+        strict_fifo: false,
         argv,
     };
     let mut it = flags.iter();
@@ -304,6 +316,7 @@ fn os_run(args: &[String]) -> Result<i32, String> {
             "--headroom" => o.headroom_mib = value("--headroom")?.parse().map_err(|_| "--headroom takes MiB")?,
             "--adapter" => o.adapter = Some(value("--adapter")?),
             "--quiet" | "-q" => o.quiet = true,
+            "--strict-fifo" => o.strict_fifo = true,
             s => return Err(format!("unknown run option {s}; see --help")),
         }
     }

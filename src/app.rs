@@ -79,6 +79,11 @@ pub fn ps(o: &Opts) -> Result<(), String> {
     }
     let width = if o.wide { usize::MAX } else { crate::width() };
     print!("{}", render(&adapters, &sample, &rows, None, width));
+    for p in crate::nvml::read() {
+        if let Some(w) = crate::power::warning(&p) {
+            println!("\nWARNING {w}");
+        }
+    }
     let untagged: Vec<u32> = rows.iter().filter(|r| !r.owner.is_tagged() && r.note.is_none()).map(|r| r.pid).collect();
     if o.trace {
         for pid in untagged {

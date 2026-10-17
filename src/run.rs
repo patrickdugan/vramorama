@@ -33,6 +33,8 @@ pub struct RunOpts {
     pub headroom_mib: u64,
     pub adapter: Option<String>,
     pub quiet: bool,
+    /// Never let a request go ahead of an earlier one (no backfill).
+    pub strict_fifo: bool,
     pub argv: Vec<String>,
 }
 
@@ -85,6 +87,8 @@ struct View {
     spills: Vec<(u32, u64)>,
     /// Each process on the card: (pid, MiB), for the thrash detector.
     procs: Vec<(u32, u64)>,
+    /// Board power and limits from NVML, for an NVIDIA card.
+    power: Option<crate::power::PowerState>,
 }
 
 fn observe(sampler: &mut Sampler, scanner: &mut Scanner, card: &Card) -> View {
@@ -118,6 +122,11 @@ fn observe(sampler: &mut Sampler, scanner: &mut Scanner, card: &Card) -> View {
         unleased_procs,
         spills: crate::scan::spills(&adapter, &sample, &rows),
         procs: rows.iter().map(|r| (r.pid, r.mib)).collect(),
+        power: if card.name.to_ascii_lowercase().contains("nvidia") {
+            crate::nvml::pick(crate::nvml::read(), Some("nvidia"))
+        } else {
+            None
+        },
     }
 }
 
@@ -279,7 +288,19 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
                     "pids {} are taking turns on the full card (thrashing); not admitting anything until it stops",
                     t.procs.iter().map(|p| p.pid.to_string()).collect::<Vec<_>>().join(" and ")
                 ))
-            } else if ledger::may_admit(&me, &leases, avail) {
+            } else if let Some(w) = view.power.as_ref().filter(|p| p.capped()) {
+                // A capped card runs everything far slower and a long kernel can trip the 2 s Windows GPU
+                // timeout, which resets the card for every session: do not add a job now.
+                fits_since = None;
+                Some(format!(
+                    "power-capped ({:.0} W enforced against a {:.0} W default); not admitting anything until it clears",
+                    w.enforced_w, w.default_w
+                ))
+            } else if if o.strict_fifo {
+                ledger::may_admit(&me, &leases, avail)
+            } else {
+                ledger::may_admit_backfill(&me, &leases, avail, card.total_mib.saturating_sub(o.headroom_mib))
+            } {
                 let (since, base) = *fits_since.get_or_insert_with(|| (Instant::now(), committed));
                 if ledger::still_growing(base, committed) {
                     // Something is still allocating, most likely a job started without a lease.
@@ -292,6 +313,15 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
                     me.state = State::Admitted;
                     me.admitted_at = Some(unix_now());
                     ledger::write(&root, &me)?;
+                    let ahead = ledger::jumped(&me, &leases);
+                    if !ahead.is_empty() && !o.quiet {
+                        eprintln!(
+                            "vramorama: lease {} goes ahead of {} earlier request(s) ({}) that cannot start yet and still fit after it",
+                            me.id,
+                            ahead.len(),
+                            ahead.join(", ")
+                        );
+                    }
                     None
                 } else {
                     if committed < base {
@@ -453,6 +483,37 @@ fn wmi_launch(argv: &[String], out: Option<&str>, tags: &[(&str, String)]) -> Re
     }
 }
 
+/// `vramorama power`: board power against the power limits, for each NVIDIA card.
+pub fn power(json_out: bool, adapter: Option<&str>) -> Result<(), String> {
+    let mut all = crate::nvml::read();
+    if let Some(w) = adapter {
+        let w = w.to_ascii_lowercase();
+        all.retain(|p| p.name.to_ascii_lowercase().contains(&w));
+    }
+    if all.is_empty() {
+        return Err("no NVIDIA card with a readable power state (nvml.dll missing or no NVIDIA driver)".into());
+    }
+    if json_out {
+        println!("{}", crate::json::Value::Arr(all.iter().map(crate::power::to_json).collect()));
+        return Ok(());
+    }
+    for p in &all {
+        println!(
+            "{}: drawing {:.0} W at {}% use; enforced limit {:.0} W, default limit {:.0} W: {}",
+            p.name,
+            p.draw_w,
+            p.util_pct,
+            p.enforced_w,
+            p.default_w,
+            if p.capped() { "CAPPED" } else { "ok" }
+        );
+        if let Some(w) = crate::power::warning(p) {
+            println!("  WARNING {w}");
+        }
+    }
+    Ok(())
+}
+
 /// `vramorama leases`: the ledger and what a new request could get right now.
 pub fn leases(json_out: bool, adapter: Option<&str>, headroom_mib: u64) -> Result<(), String> {
     let root =
@@ -491,6 +552,7 @@ pub fn leases(json_out: bool, adapter: Option<&str>, headroom_mib: u64) -> Resul
             ("available_mib", (avail.max(0) as u64).into()),
             ("unleased_mib", view.unleased_mib.into()),
             ("spilled", crate::scan::spills_json(&view.spills)),
+            ("power", view.power.as_ref().map_or(Value::Null, crate::power::to_json)),
             ("leases", Value::Arr(list)),
         ]);
         println!("{out}");
@@ -513,6 +575,9 @@ pub fn leases(json_out: bool, adapter: Option<&str>, headroom_mib: u64) -> Resul
         );
     }
     if let Some(w) = crate::spill::warning(&view.spills) {
+        println!("  WARNING {w}");
+    }
+    if let Some(w) = view.power.as_ref().and_then(crate::power::warning) {
         println!("  WARNING {w}");
     }
     let mut untracked: Vec<(&String, &u64)> =

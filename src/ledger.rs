@@ -147,6 +147,30 @@ pub fn may_admit(me: &Lease, leases: &[Lease], available: i64) -> bool {
     !ahead && me.vram_mib as i64 <= available
 }
 
+/// Like `may_admit`, but a small request may go ahead of a larger one that cannot start yet
+/// (backfill), so a request that is waiting for a 12 GiB gap does not idle a card that has 5 GiB free
+/// for hours. It may jump the queue only if it still fits and every earlier waiting request would
+/// still fit on the card once `me` is running: `capacity` is the card's total less headroom. Then `me`
+/// can delay an earlier request only for as long as `me` runs, never push it out of reach.
+pub fn may_admit_backfill(me: &Lease, leases: &[Lease], available: i64, capacity: u64) -> bool {
+    if me.vram_mib as i64 > available {
+        return false;
+    }
+    leases
+        .iter()
+        .filter(|l| l.id != me.id && l.state == State::Waiting && earlier(l, me))
+        .all(|l| l.vram_mib as i64 > available && l.vram_mib + me.vram_mib <= capacity)
+}
+
+/// The earlier waiting requests `me` would go ahead of by backfilling (empty when it is first in line).
+pub fn jumped(me: &Lease, leases: &[Lease]) -> Vec<String> {
+    leases
+        .iter()
+        .filter(|l| l.id != me.id && l.state == State::Waiting && earlier(l, me))
+        .map(|l| l.id.clone())
+        .collect()
+}
+
 pub fn queue_position(me: &Lease, leases: &[Lease]) -> usize {
     leases.iter().filter(|l| l.id != me.id && l.state == State::Waiting && earlier(l, me)).count()
 }
@@ -321,6 +345,29 @@ mod tests {
         assert!(may_admit(&big, &all, 12000));
         assert_eq!(queue_position(&small, &all), 1);
         assert_eq!(queue_position(&big, &all), 0);
+    }
+
+    #[test]
+    fn backfill_lets_a_small_request_use_a_gap_a_blocked_big_one_cannot() {
+        // 2026-10-15: a 12 GiB request waited 6 h behind a job using 10.5 GiB; 4.8 GiB sat free.
+        let big = lease("big", State::Waiting, 12288, 1.0);
+        let small = lease("small", State::Waiting, 3072, 2.0);
+        let all = [big.clone(), small.clone()];
+        let capacity = 15915 - 512;
+        assert!(!may_admit(&small, &all, 4854), "strict first-come-first-served still refuses");
+        assert!(may_admit_backfill(&small, &all, 4854, capacity));
+        assert_eq!(jumped(&small, &all), ["big"]);
+        // It must still fit now.
+        assert!(!may_admit_backfill(&small, &all, 3000, capacity));
+        // A request that would leave the big one unable to fit even on an empty card may not jump:
+        // 15403 - 4096 = 11307 < 12288.
+        let medium = lease("medium", State::Waiting, 4096, 3.0);
+        assert!(!may_admit_backfill(&medium, &[big.clone(), medium.clone()], 4854, capacity));
+        // An earlier request that does fit now is served first, not jumped.
+        let fits = lease("fits", State::Waiting, 2000, 0.5);
+        assert!(!may_admit_backfill(&small, &[fits, small.clone()], 4854, capacity));
+        // The head of the queue is admitted as usual.
+        assert!(may_admit_backfill(&big, &all, 12288, capacity));
     }
 
     #[test]

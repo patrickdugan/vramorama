@@ -84,7 +84,7 @@ is required: no SDK headers, no import libraries beyond what Rust itself links.
 | `vramorama leases` | The lease ledger, how much a new request could get right now, memory held by processes outside any lease, and any spill. `--json`. |
 | `vramorama hook` | A Claude Code `PreToolUse` hook that stops WMI / Task Scheduler launches that would strip a job's tags. See [The agent hook](#the-agent-hook). |
 | `vramorama idle` | Processes that held memory but did no GPU work for `--window` seconds (default 20), each judged *stale* or *idle*. See [Idle holders](#idle-holders). |
-| `vramorama reclaim [PID…]` | Re-checks idle holders (all stale ones if no PID is given) and prints the command that would free them. It never stops anything itself. |
+| `vramorama reclaim [PID…]` | Re-checks idle holders (all stale ones if no PID is given) and prints the command that would free them. With `--ram` it frees RAM instead and stops supervised jobs from the top (see [Supervisors](#supervisors)). It never stops anything itself. |
 
 Leave a watcher running overnight:
 
@@ -230,6 +230,40 @@ limit, allocations fail. The GUI warns when less than 5% of RAM is available or 
 A Claude session can outlive the `claude.exe` its jobs were started from (resuming it, or the
 desktop app restarting, starts a new one); its jobs count as live, and are never called stale,
 while another Claude Code process runs the session.
+
+### Supervisors
+
+Killing a 9 GiB model server in Task Manager does nothing for long when the script that launched
+it starts it again. The RAM comes back, and so does the process. What frees it is stopping the
+*tree*, from the topmost process that belongs to the job.
+
+`ram` follows each process of 256 MiB or more up through its parents. A parent that is a real
+program, and not a launcher, is a **supervisor**: it can start the job again. Shells, `cmd /c`
+wrappers and `vramorama run` are launchers, and so is a venv's `python.exe` shim (same command
+line as the process it starts). `ram` prints one line per supervised job with the supervisors, the
+size of the whole tree, and the command that stops it:
+
+```text
+Supervised: stopping these alone frees nothing for long, because a process above them starts them again.
+  34564 9,017 MiB, restarted by python.exe 18852; stop the whole job (6 processes, 9,197 MiB): taskkill /PID 23168 /T /F
+```
+
+- The walk stops below the system (`services`, `explorer`, `wmiprvse`, the Hyper-V and WSL hosts),
+  terminals and interactive shells, and the agent apps themselves, so a stop command never
+  includes them. It also stops below vramorama's own ancestors, so the command never kills the
+  shell that ran it. A parent that started after its child is a recycled pid and ends the walk.
+  System and protected processes (WSL's VM, memory compression) are not shown as supervised.
+- `ram --json` adds `supervised`, `supervisors`, `stop_root`, `stop_command` and `tree_ram_mib`.
+- `reclaim --ram [PID…]` prints the tree-stop command for the PIDs you name (`--force` for a job
+  whose session is still running), or for every job of an ended session holding 1 GiB or more. The
+  GPU `reclaim` does the same for a supervised holder instead of printing a `Stop-Process` that
+  would be undone.
+- `watch` notices respawns as they happen: the same command line started again under the same
+  live parent prints a `WARNING` with the number of restarts and the command that stops the job.
+  A one-off `ram` cannot see history, so it reports who *would* restart a process, and `watch` who
+  *did*.
+
+vramorama still never stops anything. It prints the command.
 
 ## Sharing the card: `vramorama run`
 

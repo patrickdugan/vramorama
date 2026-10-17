@@ -10,8 +10,10 @@ mod ledger;
 mod owner;
 mod parse;
 mod report;
+mod respawn;
 mod sessions;
 mod spill;
+mod supervisor;
 mod thrash;
 mod transcripts;
 
@@ -75,9 +77,11 @@ USAGE
       A live page in your browser: memory by agent session and by app, an hour of
       history, processes, idle and stale holders, leases, and trace. Served on 127.0.0.1
       (default port 7787; 0 picks a free one) with an access token; read-only.
-  vramorama reclaim [PID...] [--force] [--window SECS]
+  vramorama reclaim [PID...] [--ram] [--force] [--window SECS]
       Re-check idle holders (all stale ones if no PID is given) and print the command
-      that would free their memory. vramorama never stops a process itself.
+      that would free their memory. With --ram, free RAM instead: jobs of ended sessions
+      holding 1 GiB or more, or the PIDs you name. A job that something above restarts is
+      stopped from the top, with its tree (taskkill /T). vramorama never stops a process itself.
 
 OPTIONS
   --json        machine-readable output
@@ -118,6 +122,7 @@ pub struct Opts {
     pub adapter: Option<String>,
     pub window: Option<f64>,
     pub force: bool,
+    pub ram: bool,
     pub min_given: bool,
     pub port: Option<u16>,
     pub no_open: bool,
@@ -145,6 +150,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
                 o.min_ram = Some(value("--min-ram")?.parse().map_err(|_| "--min-ram takes a whole number of MiB")?)
             }
             "--force" => o.force = true,
+            "--ram" => o.ram = true,
             "--no-open" => o.no_open = true,
             "--port" => o.port = Some(value("--port")?.parse().map_err(|_| "--port takes a number from 0 to 65535")?),
             "--window" => {
@@ -317,7 +323,7 @@ fn os_reclaim(o: Opts) -> Result<i32, String> {
         .iter()
         .map(|p| p.parse::<u32>().map_err(|_| format!("not a pid: {p}")))
         .collect::<Result<Vec<_>, _>>()?;
-    app::reclaim(&pids, o.force, o.window.unwrap_or(10.0))
+    app::reclaim(&pids, o.force, o.window.unwrap_or(10.0), o.ram)
 }
 
 #[cfg(not(windows))]

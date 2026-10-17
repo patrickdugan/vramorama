@@ -18,6 +18,51 @@ use crate::transcripts::{self, Kind, Needle};
 
 const MIB: u64 = 1 << 20;
 
+/// Only supervised processes holding at least this much RAM are called out: smaller ones are
+/// not worth a warning, and most jobs have some launcher above them.
+const SUPERVISED_MIN_MIB: u64 = 256;
+
+/// The process tree as `supervisor` reads it: parents, names, start times and RAM.
+fn tree_nodes(
+    table: &HashMap<u32, procs::Entry>,
+    mem: &HashMap<u32, procs::Mem>,
+) -> HashMap<u32, crate::supervisor::Node> {
+    table
+        .iter()
+        .map(|(&pid, e)| {
+            let m = mem.get(&pid);
+            let node = crate::supervisor::Node {
+                pid,
+                ppid: e.ppid,
+                name: e.exe.clone(),
+                created: m.map(|m| m.created),
+                ram_mib: m.map_or(0, |m| m.private_ws / MIB),
+            };
+            (pid, node)
+        })
+        .collect()
+}
+
+/// What stopping `pid` takes: its supervisor tree, reading a shell's command line only when the
+/// walk reaches that shell.
+fn supervision_of(pid: u32, nodes: &HashMap<u32, crate::supervisor::Node>) -> crate::supervisor::Supervision {
+    let protect = crate::supervisor::lineage(std::process::id(), nodes);
+    crate::supervisor::supervision(pid, nodes, &protect, &|p| procs::details(p).cmdline)
+}
+
+/// One line saying what sits above a process and how to stop all of it.
+fn supervisor_line(s: &crate::supervisor::Supervision, nodes: &HashMap<u32, crate::supervisor::Node>) -> String {
+    let names: Vec<String> =
+        s.supervisors.iter().filter_map(|p| nodes.get(p).map(|n| format!("{} {}", n.name, n.pid))).collect();
+    format!(
+        "restarted by {}; stop the whole job ({} processes, {} MiB): {}",
+        names.join(", "),
+        s.tree.len(),
+        thousands(s.tree_ram_mib),
+        crate::supervisor::kill_tree_command(s.root)
+    )
+}
+
 pub fn ps(o: &Opts) -> Result<(), String> {
     let mut sampler = Sampler::open()?;
     sampler.prime();
@@ -65,6 +110,7 @@ pub fn watch(o: &Opts) -> Result<(), String> {
     let since = now_filetime();
     // Enough samples to see processes take turns, at any interval.
     let mut thrash = crate::thrash::Detector::new((12.0 * o.interval).max(60.0));
+    let mut respawns = crate::respawn::Tracker::default();
     loop {
         std::thread::sleep(Duration::from_secs_f64(o.interval));
         let sample = sampler.sample();
@@ -72,7 +118,10 @@ pub fn watch(o: &Opts) -> Result<(), String> {
         let adapters = pick_adapters(dxgi.clone(), &sample, o.all);
         let luids: Vec<u64> = adapters.iter().map(|a| a.luid).collect();
         let mut rows = scanner.rows(&sample, &table, &luids, o.min_mib);
-        crate::scan::attach_ram(&mut rows, &procs::memory());
+        let mem = procs::memory();
+        crate::scan::attach_ram(&mut rows, &mem);
+        let nodes = tree_nodes(&table, &mem);
+        feed_respawns(&mut respawns, &scanner.ram_rows(&table, &mem), &nodes);
         let now = now_filetime();
         feed_thrash(&mut thrash, &adapters, &sample, &rows, filetime_to_unix(now));
         for r in &rows {
@@ -109,10 +158,55 @@ pub fn watch(o: &Opts) -> Result<(), String> {
                 }
             }
             screen.push_str(&render_marks(&marks, width));
+            screen.push_str(&respawn_warnings(&respawns, &nodes, width));
             print!("{screen}");
             std::io::stdout().flush().ok();
         }
     }
+}
+
+/// Record each big job's command under its parent, so a command that keeps coming back is seen.
+fn feed_respawns(t: &mut crate::respawn::Tracker, ram_rows: &[Row], nodes: &HashMap<u32, crate::supervisor::Node>) {
+    for r in ram_rows {
+        let big = r.ram.is_some_and(|m| m.private_mib >= SUPERVISED_MIN_MIB);
+        let (Some(cmd), Some(node)) = (r.cmd.as_deref(), nodes.get(&r.pid)) else { continue };
+        if r.agent_proc || !big {
+            continue;
+        }
+        let (Some(created), Some(parent)) = (node.created, nodes.get(&node.ppid)) else { continue };
+        if let Some(pc) = parent.created.filter(|pc| *pc <= created) {
+            t.observe((parent.pid, pc), &r.name, cmd, (r.pid, created));
+        }
+    }
+    let live: std::collections::HashSet<(u32, u64)> =
+        nodes.values().filter_map(|n| n.created.map(|c| (n.pid, c))).collect();
+    t.retain_parents(&live);
+}
+
+/// The commands that were started again under a parent that is still running: whoever is above
+/// them restarts them, so killing them in Task Manager frees nothing for long.
+fn respawn_warnings(
+    t: &crate::respawn::Tracker,
+    nodes: &HashMap<u32, crate::supervisor::Node>,
+    width: usize,
+) -> String {
+    let mut out = String::new();
+    for r in t.respawns() {
+        let parent = nodes.get(&r.parent.0).map_or("?", |n| n.name.as_str());
+        let s = supervision_of(r.parent.0, nodes);
+        let line = format!(
+            "WARNING {} was started again {} time(s) under {parent} {}; stopping it alone frees nothing for long. Stop the job ({} processes, {} MiB): {}",
+            r.name,
+            r.restarts,
+            r.parent.0,
+            s.tree.len(),
+            thousands(s.tree_ram_mib),
+            crate::supervisor::kill_tree_command(s.root)
+        );
+        out.push_str(&ellipsize(&line, width));
+        out.push('\n');
+    }
+    out
 }
 
 /// Add one sample of every shown adapter to a thrash detector.
@@ -614,6 +708,7 @@ struct Look {
     ram: Vec<Row>,
     sys: Option<procs::SysMem>,
     table: HashMap<u32, procs::Entry>,
+    mem: HashMap<u32, procs::Mem>,
 }
 
 fn look(o: &Opts) -> Look {
@@ -636,7 +731,7 @@ fn look(o: &Opts) -> Look {
     }
     let ram = scanner.ram_rows(&table, &mem);
     let vram_total = adapters.iter().map(|a| a.dedicated / MIB).sum();
-    Look { adapters, vram_used, vram_total, gpu, ram, sys: procs::system_memory(), table }
+    Look { adapters, vram_used, vram_total, gpu, ram, sys: procs::system_memory(), table, mem }
 }
 
 fn print_header(l: &Look) {
@@ -759,6 +854,21 @@ pub fn ram(o: &Opts) -> Result<(), String> {
     let min = if o.min_given { o.min_mib } else { 64 };
     let rows: Vec<&Row> = l.ram.iter().filter(|r| r.ram.is_some_and(|m| m.private_mib >= min)).collect();
     let vram = |pid: u32| -> u64 { l.gpu.iter().filter(|g| g.pid == pid).map(|g| g.mib).sum() };
+    let nodes = tree_nodes(&l.table, &l.mem);
+    // Who would start each big process again if it were stopped, by pid.
+    let supervised: HashMap<u32, crate::supervisor::Supervision> = rows
+        .iter()
+        .filter(|r| {
+            // System and protected processes (WSL's VM, memory compression) are not jobs to restart.
+            !r.agent_proc
+                && r.note.is_none()
+                && !is_host(&r.name)
+                && crate::scan::known_process(&r.name).is_none()
+                && r.ram.is_some_and(|m| m.private_mib >= SUPERVISED_MIN_MIB)
+        })
+        .map(|r| (r.pid, supervision_of(r.pid, &nodes)))
+        .filter(|(_, s)| s.supervised())
+        .collect();
     if o.json {
         let list = rows
             .iter()
@@ -767,6 +877,15 @@ pub fn ram(o: &Opts) -> Result<(), String> {
                 if let Value::Obj(kv) = &mut j {
                     kv.push(("session_key".into(), r.session_group().0.into()));
                     kv.push(("vram_mib".into(), vram(r.pid).into()));
+                    let s = supervised.get(&r.pid);
+                    kv.push(("supervised".into(), s.is_some().into()));
+                    kv.push((
+                        "supervisors".into(),
+                        Value::Arr(s.map_or_else(Vec::new, |s| s.supervisors.iter().map(|p| (*p).into()).collect())),
+                    ));
+                    kv.push(("stop_root".into(), s.map(|s| s.root).into()));
+                    kv.push(("stop_command".into(), s.map(|s| crate::supervisor::kill_tree_command(s.root)).into()));
+                    kv.push(("tree_ram_mib".into(), s.map(|s| s.tree_ram_mib).into()));
                 }
                 j
             })
@@ -805,7 +924,7 @@ pub fn ram(o: &Opts) -> Result<(), String> {
         "{:>7} {:>8} {:>8} {:>8}  {:<11}  {:<44}  COMMAND",
         "PID", "RAM MiB", "COMMIT", "VRAM", "STARTED", "OWNER"
     );
-    for r in rows {
+    for r in &rows {
         let m = r.ram.unwrap_or_default();
         let owner = if r.agent_proc {
             format!("agent: {}", session_text(r).unwrap_or_else(|| owner_text(r)))
@@ -825,7 +944,39 @@ pub fn ram(o: &Opts) -> Result<(), String> {
         );
         println!("{}", ellipsize(&line, width));
     }
+    print_supervised(&rows, &supervised, &nodes, width);
     Ok(())
+}
+
+/// After the RAM table: the jobs that something above would start again, one line per job, with
+/// the command that stops the whole tree. Stopping the big process alone frees nothing for long.
+fn print_supervised(
+    rows: &[&Row],
+    supervised: &HashMap<u32, crate::supervisor::Supervision>,
+    nodes: &HashMap<u32, crate::supervisor::Node>,
+    width: usize,
+) {
+    let mut by_root: Vec<(&crate::supervisor::Supervision, Vec<&Row>)> = Vec::new();
+    for r in rows {
+        let Some(s) = supervised.get(&r.pid) else { continue };
+        match by_root.iter_mut().find(|(b, _)| b.root == s.root) {
+            Some((_, v)) => v.push(r),
+            None => by_root.push((s, vec![r])),
+        }
+    }
+    if by_root.is_empty() {
+        return;
+    }
+    println!(
+        "\nSupervised: stopping these alone frees nothing for long, because a process above them starts them again."
+    );
+    for (s, group) in by_root {
+        let pids: Vec<String> = group.iter().map(|r| r.pid.to_string()).collect();
+        let held: u64 = group.iter().filter_map(|r| r.ram).map(|m| m.private_mib).sum();
+        let line = format!("  {} {} MiB, {}", pids.join(","), thousands(held), supervisor_line(s, nodes));
+        println!("{}", ellipsize(&line, width));
+    }
+    println!("vramorama never stops processes itself. Check the pids are still the ones listed before running it.");
 }
 
 /// Each process seen in the last sample of a window, with its busiest engine reading over the window.
@@ -939,7 +1090,10 @@ pub fn idle(o: &Opts, window: f64) -> Result<(), String> {
 /// and nobody appears to want it (`idle::classify` says stale); `force` also clears idle
 /// processes whose owner may still want them, with a warning. Without PIDs, every stale holder
 /// is checked. Exit code 1 when any named PID is not cleared.
-pub fn reclaim(pids: &[u32], force: bool, window: f64) -> Result<i32, String> {
+pub fn reclaim(pids: &[u32], force: bool, window: f64, ram: bool) -> Result<i32, String> {
+    if ram {
+        return reclaim_ram(pids, force);
+    }
     let (_, rows) = observe_window(window, true, 1)?;
     let pids: Vec<u32> = if pids.is_empty() {
         // Small holders (browsers, chat apps) are never worth reclaiming unasked.
@@ -993,12 +1147,111 @@ pub fn reclaim(pids: &[u32], force: bool, window: f64) -> Result<i32, String> {
     }
     if !cleared.is_empty() {
         let total: u64 = cleared.iter().map(|(_, m, _)| m).sum();
-        let ids: Vec<String> = cleared.iter().map(|(p, _, _)| p.to_string()).collect();
-        println!("\nTo free {} MiB, run (PowerShell): Stop-Process -Id {}", thousands(total), ids.join(","));
+        // A process something above restarts has to be stopped from the top of its job.
+        let nodes = tree_nodes(&procs::snapshot(), &procs::memory());
+        let mut plain: Vec<String> = Vec::new();
+        let mut trees: Vec<(u32, String)> = Vec::new();
+        for (pid, _, _) in &cleared {
+            let s = supervision_of(*pid, &nodes);
+            if s.supervised() {
+                if !trees.iter().any(|(root, _)| *root == s.root) {
+                    trees.push((s.root, supervisor_line(&s, &nodes)));
+                }
+            } else {
+                plain.push(pid.to_string());
+            }
+        }
+        println!("\nTo free {} MiB:", thousands(total));
+        if !plain.is_empty() {
+            println!("  (PowerShell) Stop-Process -Id {}", plain.join(","));
+        }
+        for (_, line) in &trees {
+            println!("  {line}");
+        }
         let starts: Vec<String> =
             cleared.iter().map(|(p, _, s)| format!("{p} started {}", s.map(fmt_short).unwrap_or("?".into()))).collect();
         println!("vramorama never stops processes itself. Pids get reused, so check first that they are still the");
         println!("processes it checked ({}).", starts.join(", "));
+    }
+    Ok(code)
+}
+
+/// `vramorama reclaim --ram [PID...]`: the commands that would free RAM held by agent-session
+/// processes. Stopping the process alone does nothing when something above it restarts it, so
+/// each is stopped from the top of its job, with the tree. Without PIDs, the jobs of sessions
+/// that have ended (and only those) holding 1 GiB or more. vramorama never stops anything itself.
+fn reclaim_ram(pids: &[u32], force: bool) -> Result<i32, String> {
+    let l = look(&Opts { min_mib: 16, ..Default::default() });
+    let nodes = tree_nodes(&l.table, &l.mem);
+    let pids: Vec<u32> = if pids.is_empty() {
+        let stale: Vec<u32> = l
+            .ram
+            .iter()
+            .filter(|r| {
+                !r.agent_proc
+                    && r.owner.is_tagged()
+                    && r.harness_live == Some(false)
+                    && r.ram.is_some_and(|m| m.private_mib >= crate::scan::BIG_UNTAGGED_MIB)
+            })
+            .map(|r| r.pid)
+            .collect();
+        if stale.is_empty() {
+            println!("No process of an ended agent session holds 1 GiB of RAM or more. Name a pid to check one.");
+        }
+        stale
+    } else {
+        pids.to_vec()
+    };
+    let (mut code, mut total) = (0, 0);
+    let mut roots: Vec<u32> = Vec::new();
+    for pid in pids {
+        let Some(r) = l.ram.iter().find(|r| r.pid == pid) else {
+            println!("{pid}: not in an agent session and under 1 GiB; nothing to free");
+            code = 1;
+            continue;
+        };
+        let mib = r.ram.map_or(0, |m| m.private_mib);
+        let (verdict, why) = judge(r);
+        let refuse = if r.agent_proc {
+            Some("it is the agent itself".to_string())
+        } else if r.note.is_some() || is_host(&r.name) {
+            Some("it is a system or protected process".to_string())
+        } else if verdict != Verdict::Stale && !force {
+            Some(format!("{why}; add --force to include it anyway"))
+        } else {
+            None
+        };
+        if let Some(reason) = refuse {
+            println!("{pid} {}: leave it: {reason}", r.name);
+            code = 1;
+            continue;
+        }
+        let warn = if verdict == Verdict::Stale { String::new() } else { " WARNING: may still be wanted".into() };
+        println!("{pid} {}: {} MiB, {why}{warn}", r.name, thousands(mib));
+        println!("    {}", command_text(r));
+        total += mib;
+        let s = supervision_of(pid, &nodes);
+        if s.supervised() {
+            println!("    {}", supervisor_line(&s, &nodes));
+        }
+        if !roots.contains(&s.root) {
+            roots.push(s.root);
+        }
+    }
+    if !roots.is_empty() {
+        println!("\nTo free {} MiB, stop each job from the top, with its tree:", thousands(total));
+        for root in &roots {
+            let s = supervision_of(*root, &nodes);
+            let name = nodes.get(root).map_or("?", |n| n.name.as_str());
+            println!(
+                "  {}    # {name} {root}: {} process(es), {} MiB",
+                crate::supervisor::kill_tree_command(*root),
+                s.tree.len(),
+                thousands(s.tree_ram_mib)
+            );
+        }
+        println!("vramorama never stops processes itself. Pids get reused, so check first that they are still the");
+        println!("processes it checked.");
     }
     Ok(code)
 }

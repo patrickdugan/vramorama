@@ -127,7 +127,8 @@ USAGE
       Re-check idle holders (all stale ones if no PID is given) and print the command
       that would free their memory. With --ram, free RAM instead: jobs of ended sessions
       holding 1 GiB or more, or the PIDs you name. A job that something above restarts is
-      stopped from the top, with its tree (taskkill /T). vramorama never stops a process itself.
+      stopped from the top, with its tree (taskkill /T). reclaim only prints the command; vramorama
+      stops a process only when it is a job `run` started with --guard-power or --enforce-vram.
 
 OPTIONS
   --json        machine-readable output

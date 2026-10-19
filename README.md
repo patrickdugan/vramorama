@@ -266,7 +266,9 @@ Supervised: stopping these alone frees nothing for long, because a process above
   A one-off `ram` cannot see history, so it reports who *would* restart a process, and `watch` who
   *did*.
 
-vramorama still never stops anything. It prints the command.
+`ram`, `reclaim` and `watch` never stop anything; they print the command. The only process vramorama
+ever stops is a job that `vramorama run` started itself, and only when you asked for it with
+`--guard-power` or `--enforce-vram` (see [run](#sharing-the-card-vramorama-run)).
 
 ## Sharing the card: `vramorama run`
 
@@ -476,8 +478,9 @@ judges each one:
 `reclaim` repeats the checks for the PIDs you name, or for every stale holder of at least 256 MiB,
 and refuses busy, system and possibly-wanted processes (`--force` includes the last group with a
 warning). For the rest it prints a `Stop-Process -Id …` line with each process's start time, so you
-can confirm the pid has not been reused. vramorama does not stop processes itself; that decision
-stays with whoever runs the command.
+can confirm the pid has not been reused. `reclaim` does not stop processes itself; that decision
+stays with whoever runs the command. (vramorama stops a process only when it is a job `run`
+started and you passed `--guard-power` or `--enforce-vram`.)
 
 ## Crashes and risks
 

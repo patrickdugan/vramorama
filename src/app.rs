@@ -142,8 +142,15 @@ pub fn watch(o: &Opts) -> Result<(), String> {
         update_marks(&mut marks, &rows, now);
         if let Some(f) = log.as_mut() {
             let list = adapters.iter().map(|a| adapter_json(a, &sample, &rows)).collect();
-            let line =
-                obj([("ts", filetime_to_unix(now).into()), ("t", fmt_utc(now).into()), ("adapters", Value::Arr(list))]);
+            // RAM and commit charge go in the log too: `vramorama crashes` reads them back to tell memory
+            // pressure from a driver fault.
+            let system = procs::system_memory().map_or(Value::Null, |m| crate::scan::system_memory_json(&m));
+            let line = obj([
+                ("ts", filetime_to_unix(now).into()),
+                ("t", fmt_utc(now).into()),
+                ("adapters", Value::Arr(list)),
+                ("system", system),
+            ]);
             writeln!(f, "{line}").and_then(|_| f.flush()).map_err(|e| format!("writing log: {e}"))?;
         }
         if !o.quiet {

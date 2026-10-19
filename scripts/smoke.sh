@@ -9,6 +9,8 @@ check() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "
 $V run --vram 64M --quiet --wait 86400 -- cmd /c "exit 7";                      check "exit code passes through" $? 7
 $V run --vram 64M --quiet --wait 86400 --restart 2 -- cmd /c "exit 3";          check "plain failure is not retried (no GPU reset logged)" $? 3
 $V run --vram 64M --quiet --wait 86400 --guard-power 60 -- cmd /c "exit 0";     check "guard flags leave a healthy job alone" $? 0
+$V doctor --json > /dev/null;                                                    check "doctor reads the machine and exits cleanly" $? 0
+$V crashes --json --days 1 > /dev/null;                                          check "crashes reads the event log and exits cleanly" $? 0
 if [ -n "$PERP" ] && [ -n "$MODEL" ]; then
   $V run --vram 256M --quiet --wait 86400 --enforce-vram 128 -- "$PERP" -m "$MODEL" -f README.md -c 128 -ngl 999 > /dev/null 2>&1
   check "a job over its lease is stopped (exit 3)" $? 3

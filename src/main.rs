@@ -3,6 +3,8 @@
 // Off Windows only `report` exists, so most of the shared code is unused there.
 #![cfg_attr(not(windows), allow(dead_code))]
 
+mod crash;
+mod doctor;
 mod guard;
 mod hook;
 mod idle;
@@ -25,6 +27,10 @@ mod agents;
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
+mod evt;
+#[cfg(windows)]
+mod forensics;
+#[cfg(windows)]
 mod gpu;
 #[cfg(windows)]
 mod gui;
@@ -38,6 +44,8 @@ mod run;
 mod scan;
 #[cfg(windows)]
 mod sys;
+#[cfg(windows)]
+mod sysinfo;
 
 const HELP: &str = "\
 vramorama: who is holding my GPU?
@@ -67,13 +75,19 @@ USAGE
       Find the agent transcript whose session launched PID (for untagged processes).
   vramorama run --vram SIZE [--owner NAME] [--detach [--out FILE]] [--wait SECS]
                 [--settle SECS] [--headroom MIB] [--adapter NAME] [--strict-fifo] [--quiet]
-                [--restart N] [--guard-power SECS] [--enforce-vram SLACK_MIB] -- COMMAND...
+                [--restart N] [--guard-power SECS] [--enforce-vram SLACK_MIB]
+                [--max-commit PCT] [--allow-display-off] [--no-keep-awake] -- COMMAND...
       Wait until SIZE (e.g. 9G, 6000M) fits on the card, first come first served, then
       run COMMAND tagged VRAMORAMA_LEASE=<id> and keep the reservation until it and its
       children exit. A small request may go ahead of a larger one that cannot start yet, if
       the larger one would still fit afterwards (--strict-fifo turns that off). Nothing is
-      admitted while the card is power-capped (see `power`). --detach starts it outside this
-      session (output to --out).
+      admitted while the card is power-capped (see `power`) or the system commit charge is at
+      or above --max-commit PCT of its limit (default 92; 0 turns that off). While the job runs
+      `run` asks Windows to keep the machine awake and the screen on, so it does not drop into
+      Modern Standby mid-job (a frequent trigger of the crashes `crashes` finds); that changes
+      no setting and ends with the job. --allow-display-off lets the screen switch off,
+      --no-keep-awake asks for nothing. --detach starts it outside this session (output to --out)
+      and then cannot hold the machine awake.
       Supervised runs (opt-in, the job stays attached to this process; they only ever stop a job
       that `run` itself started):
         --restart N          start the job again, up to N times, after a Windows GPU reset (a TDR
@@ -86,6 +100,17 @@ USAGE
       to under half its default (a 15 W cap against 80 W) runs many times slower, and one long
       kernel can pass Windows' 2 s limit and reset the card for every session. Also lists the GPU
       resets Windows logged in the last 24 hours.
+  vramorama crashes [--days N] [--last N] [--log FILE] [--json]
+      Why the machine rebooted, from the Windows event log (read-only): every unexpected reboot in the
+      last N days (default 30) with its bugcheck decoded (0x10E VIDEO_MEMORY_MANAGEMENT_INTERNAL, 0x116
+      VIDEO_TDR_FAILURE, ...), the module a fault names, whether Modern Standby was in progress, GPU
+      resets before it, and a verdict: memory pressure, a standby fault, a TDR cascade, or a driver fault
+      with one job running (not contention). Lined up with a `watch --log` file (--log FILE, else the
+      .jsonl files in ~/.vramorama) for what held the GPU and RAM just before. --last N shows N incidents.
+  vramorama doctor [--days N] [--log FILE] [--json]
+      Risk checks, read-only, each with advice: screen-off and sleep timeouts on a Modern Standby PC,
+      the display driver's age, commit charge and free RAM, spill into shared GPU memory, a power cap,
+      recent GPU resets and the crash record. Changes no setting.
   vramorama leases [--json] [--headroom MIB] [--adapter NAME]
       Current leases, and how much a new request could get now.
   vramorama hook
@@ -149,6 +174,8 @@ pub struct Opts {
     pub no_open: bool,
     pub by_session: bool,
     pub min_ram: Option<u64>,
+    pub days: Option<f64>,
+    pub last: Option<usize>,
     pub positional: Vec<String>,
 }
 
@@ -170,6 +197,14 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--min-ram" => {
                 o.min_ram = Some(value("--min-ram")?.parse().map_err(|_| "--min-ram takes a whole number of MiB")?)
             }
+            "--days" => {
+                let d: f64 = value("--days")?.parse().map_err(|_| "--days takes a number of days")?;
+                if !(0.04..=3650.0).contains(&d) {
+                    return Err("--days must be between 0.04 and 3650".into());
+                }
+                o.days = Some(d);
+            }
+            "--last" => o.last = Some(value("--last")?.parse().map_err(|_| "--last takes a count")?),
             "--force" => o.force = true,
             "--ram" => o.ram = true,
             "--no-open" => o.no_open = true,
@@ -245,9 +280,8 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         "run" => os_run(rest),
-        "ps" | "sessions" | "ram" | "thrash" | "watch" | "trace" | "leases" | "idle" | "gui" | "power" => {
-            os_command(cmd, parse_opts(rest)?).map(|()| 0)
-        }
+        "ps" | "sessions" | "ram" | "thrash" | "watch" | "trace" | "leases" | "idle" | "gui" | "power" | "crashes"
+        | "doctor" => os_command(cmd, parse_opts(rest)?).map(|()| 0),
         "reclaim" => os_reclaim(parse_opts(rest)?),
         other => Err(format!("unknown command {other}; see --help")),
     }
@@ -269,6 +303,8 @@ fn os_command(cmd: &str, o: Opts) -> Result<(), String> {
         "watch" => app::watch(&o),
         "leases" => run::leases(o.json, o.adapter.as_deref(), o.headroom_mib),
         "power" => run::power(o.json, o.adapter.as_deref()),
+        "crashes" => forensics::crashes(&o),
+        "doctor" => forensics::doctor(&o),
         "gui" => gui::gui(gui::GuiOpts {
             port: o.port.unwrap_or(7787),
             open: !o.no_open,
@@ -310,6 +346,8 @@ fn os_run(args: &[String]) -> Result<i32, String> {
         adapter: None,
         quiet: false,
         strict_fifo: false,
+        max_commit_pct: doctor::DEFAULT_MAX_COMMIT_PCT,
+        awake: sys::Awake::SystemAndDisplay,
         policy: guard::Policy::default(),
         argv,
     };
@@ -329,6 +367,16 @@ fn os_run(args: &[String]) -> Result<i32, String> {
             "--adapter" => o.adapter = Some(value("--adapter")?),
             "--quiet" | "-q" => o.quiet = true,
             "--strict-fifo" => o.strict_fifo = true,
+            "--max-commit" => {
+                o.max_commit_pct = value("--max-commit")?
+                    .trim_end_matches('%')
+                    .parse()
+                    .ok()
+                    .filter(|p| *p <= 100)
+                    .ok_or("--max-commit takes a percentage from 0 to 100")?
+            }
+            "--allow-display-off" => o.awake = sys::Awake::System,
+            "--no-keep-awake" => o.awake = sys::Awake::Off,
             "--restart" => o.policy.restarts = value("--restart")?.parse().map_err(|_| "--restart takes a count")?,
             "--guard-power" => o.policy.guard_power_secs = Some(secs(value("--guard-power")?, "--guard-power")?),
             "--enforce-vram" => {

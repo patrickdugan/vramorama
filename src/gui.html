@@ -132,6 +132,10 @@ td.mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-
 .chip.stale .ic { color: var(--serious); }
 .chip.active .ic { color: var(--good); }
 .chip.idle .ic { color: var(--warning); }
+.finding { margin: 0 0 10px; padding: 8px 12px; border-left: 3px solid var(--warning); border-radius: 4px; background: color-mix(in srgb, var(--warning) 10%, transparent); }
+.finding.risk { border-left-color: var(--critical); background: color-mix(in srgb, var(--critical) 10%, transparent); }
+.finding .t { font-weight: 500; }
+.finding .a { color: var(--ink-2); font-size: 13px; margin: 4px 0 0; }
 .spill { margin: 8px 0 0; padding: 8px 12px; border-left: 3px solid var(--critical); border-radius: 4px; background: color-mix(in srgb, var(--critical) 10%, transparent); }
 .badge { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 9px; border: 1px solid var(--border); color: var(--ink-2); line-height: 17px; white-space: nowrap; }
 .actions { display: flex; gap: 6px; justify-content: flex-end; }
@@ -302,6 +306,13 @@ async function api(path) {
   return r.json();
 }
 
+// Risk checks and recent crashes come from the event log, which changes slowly: fetched on its own, every two minutes.
+let health = null;
+async function pollHealth() {
+  try { health = await api("/api/health"); if (now) render(); } catch (e) { /* the card keeps what it had */ }
+  finally { setTimeout(pollHealth, 120000); }
+}
+
 async function poll() {
   try {
     const j = await api("/api/state?since=" + since);
@@ -347,6 +358,7 @@ function render() {
     header(),
     ...now.adapters.map(adapterCard),
     memoryCard(),
+    healthCard(),
     sessionsCard(),
     timelineCard(),
     procsCard(),
@@ -823,6 +835,35 @@ function watermarkCard() {
   return card;
 }
 
+function healthCard() {
+  const head = el("div", { class: "card-head" }, el("h2", { text: "Crashes and risks" }),
+    el("p", { class: "sub", text: "read-only checks of what has been crashing this machine; vramorama doctor and vramorama crashes say more" }));
+  if (!health) return el("section", { class: "card" }, head, el("p", { class: "note", text: "Reading the event log…" }));
+  const seen = new Set();
+  const problems = health.findings.filter(f => f.severity === "risk" || f.severity === "warn");
+  const fine = health.findings.length - problems.length;
+  const rows = problems.map(f => {
+    const advice = f.advice && !seen.has(f.advice) ? (seen.add(f.advice), f.advice) : null;
+    return el("div", { class: "finding " + f.severity, role: f.severity === "risk" ? "alert" : null },
+      el("div", { class: "t" }, el("b", { text: f.severity === "risk" ? "Risk. " : "Check. " }), f.title),
+      advice ? el("p", { class: "a", text: advice }) : null);
+  });
+  const names = { standby: "Modern Standby", "memory-pressure": "memory pressure", "tdr-cascade": "GPU reset cascade", "single-workload": "driver fault, one job (not contention)", "gpu-fault": "GPU driver fault", "hard-hang": "hang or power loss", "forced-power-off": "hang, power button held", "other-bugcheck": "other bugcheck" };
+  const day = ts => new Date(ts * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  const table = health.incidents.length ? el("div", { class: "tablewrap" }, el("table", {},
+    el("thead", {}, el("tr", {}, ["When", "What", "Verdict", "Blamed"].map(h => el("th", { scope: "col", text: h })))),
+    el("tbody", {}, health.incidents.map(i => el("tr", { title: i.explanation },
+      el("td", { text: day(i.crashed) }),
+      el("td", { class: "trunc", style: "max-width:320px", text: i.title }),
+      el("td", { text: names[i.verdict] || i.verdict }),
+      el("td", { class: "trunc", style: "max-width:240px", text: i.blamed || "–" })))))) : null;
+  return el("section", { class: "card" }, head, rows,
+    health.error ? el("p", { class: "note", text: "The event log could not be read: " + health.error }) : null,
+    health.reboots ? el("p", { class: "note", text: `${health.reboots} unexpected reboot${health.reboots === 1 ? "" : "s"} in the last ${health.days} days; the latest ${health.incidents.length} below (hover a row for the reasoning).` }) : null,
+    table,
+    el("p", { class: "note", text: `${fine} other check${fine === 1 ? "" : "s"} fine.` }));
+}
+
 function leasesCard() {
   const card = el("section", { class: "card" },
     el("div", { class: "card-head" }, el("h2", { text: "Leases" }), el("p", { class: "sub", title: now.ledger || "", text: "jobs started with vramorama run" })));
@@ -893,7 +934,7 @@ async function openTrace(pid) {
 const savedTheme = store("vramorama.theme");
 if (savedTheme === "light" || savedTheme === "dark") document.documentElement.dataset.theme = savedTheme;
 if (!token) gate("This page needs the access token from the link that vramorama gui printed.");
-else { render(); poll(); }
+else { render(); poll(); pollHealth(); }
 window.addEventListener("resize", () => { clearTimeout(window.rh); window.rh = setTimeout(() => now && render(), 150); });
 </script>
 </body>

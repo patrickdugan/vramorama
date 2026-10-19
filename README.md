@@ -80,8 +80,10 @@ is required: no SDK headers, no import libraries beyond what Rust itself links.
 | `vramorama watch` | Refreshes every `--interval` seconds (default 5) and keeps a **running watermark**: each process's peak and how long it has been idle, and each owner's current and peak total. `--log FILE` appends one JSON line per sample; `--quiet` only logs. |
 | `vramorama report FILE` | Summarises a watch log: GiB-hours (and how many of them were *idle*, held at under 1% GPU), peak, GPU% and time held per owner, or with `--by session` per agent session. Answers "what sat on the card all night?" Gaps (sleep, a stopped watcher) are capped so they do not count as use. `--json`. |
 | `vramorama trace PID` | For an untagged process: its full launch chain, and the agent transcript that typed the command. |
-| `vramorama run --vram 9G -- CMD…` | Waits for a VRAM lease (first come, first served, with backfill), then runs `CMD` tagged with it. `--detach [--out LOG]` starts it outside the session; `--strict-fifo` turns backfill off; `--restart N`, `--guard-power SECS` and `--enforce-vram MIB` supervise the job (see [Supervised runs](#supervised-runs)). See [Sharing the card](#sharing-the-card-vramorama-run). |
+| `vramorama run --vram 9G -- CMD…` | Waits for a VRAM lease (first come, first served, with backfill), then runs `CMD` tagged with it. `--detach [--out LOG]` starts it outside the session; `--strict-fifo` turns backfill off; `--restart N`, `--guard-power SECS` and `--enforce-vram MIB` supervise the job (see [Supervised runs](#supervised-runs)). See [Sharing the card](#sharing-the-card-vramorama-run). | Holds the machine awake while the job runs (`--allow-display-off`, `--no-keep-awake`) and waits while commit charge is at `--max-commit` percent of its limit. See [Crashes and risks](#crashes-and-risks).
 | `vramorama power` | Board power, the enforced power limit and the driver's default limit for each NVIDIA card, whether it is power-capped, and the GPU resets Windows logged in the last 24 h. `--json`. See [Power cap](#power-cap). |
+| `vramorama crashes` | Why the machine rebooted: each unexpected reboot in the event log (default last 30 days) with its decoded bugcheck, the driver module blamed, whether it was in Modern Standby, GPU resets before it, what a `watch --log` file shows for the minutes before, and a verdict. Read-only. `--days N`, `--last N`, `--log FILE`, `--json`. See [Crashes and risks](#crashes-and-risks). |
+| `vramorama doctor` | Read-only risk checks with advice: screen-off timeout on a Modern Standby PC, display-driver age, commit charge and free RAM, spill into shared GPU memory, power cap, recent GPU resets. Changes no setting. `--json`. |
 | `vramorama leases` | The lease ledger, how much a new request could get right now, memory held by processes outside any lease, and any spill. `--json`. |
 | `vramorama hook` | A Claude Code `PreToolUse` hook that stops WMI / Task Scheduler launches that would strip a job's tags. See [The agent hook](#the-agent-hook). |
 | `vramorama idle` | Processes that held memory but did no GPU work for `--window` seconds (default 20), each judged *stale* or *idle*. See [Idle holders](#idle-holders). |
@@ -113,7 +115,7 @@ peak, GiB-hours, idle GiB-hours, RAM and RAM peak, and the labelled jobs inside 
 to filter the process tables to it. Then a timeline of each session's GPU memory, or RAM, over the
 last 5 minutes to an hour; every GPU process with its session, job, memory and peak, GPU %, RAM,
 idle time and verdict, start time and command; every process holding RAM (see [RAM](#ram));
-per-session watermarks; and the lease ledger, with the session that asked for each lease.
+per-session watermarks; the lease ledger, with the session that asked for each lease; and a **Crashes and risks** card with the `doctor` findings and the latest reboots with their verdicts (read from the event log every two minutes).
 **By job** switches the bar, timeline and watermarks to group by job label instead.
 **Trace** on an untagged process runs `vramorama trace` and shows the launch chain and the session
 that launched it. A stale process gets **Copy stop command**; the page never stops anything itself.
@@ -306,11 +308,14 @@ lease 234228b0 pid 42620 (started through WMI, outside this session)
   sat empty, or a job that asked for more than it uses, does not keep memory from everyone else.
 - **Spill, thrash and a power cap stop admission.** While any process on the card has spilled into
   system memory (see [Spill](#spill)), processes are taking turns on it (see [Thrash](#thrash)), or
-  an NVIDIA card is power-capped (see [Power cap](#power-cap)), nothing is admitted.
+  an NVIDIA card is power-capped (see [Power cap](#power-cap)), nothing is admitted. Nor is anything
+  while the system commit charge is at or above `--max-commit` percent of its limit (default 92).
 - **The lease tag.** The job runs with `VRAMORAMA_LEASE=<id>` (and `VRAMORAMA_OWNER` with
   `--owner`), inherited by everything it starts, so memory is counted against the lease through
   launcher shims and worker processes. The lease ends when the job and every process carrying the
   tag have exited, or, while waiting, when the `run` process dies. There are no heartbeats to miss.
+- **Awake while it runs.** Attached, `run` holds the machine out of sleep and Modern Standby, and the
+  screen on, from admission to the end of the job (see [Crashes and risks](#staying-out-of-modern-standby-while-a-job-runs)).
 - **Attached or detached.** Without `--detach`, `run` waits for the job and exits with its exit
   code. With `--detach`, it returns once the job has started and prints the lease and pid. It first
   tries to leave the session's job object (`CREATE_BREAKAWAY_FROM_JOB`). Agent hosts often forbid
@@ -474,6 +479,112 @@ warning). For the rest it prints a `Stop-Process -Id …` line with each process
 can confirm the pid has not been reused. vramorama does not stop processes itself; that decision
 stays with whoever runs the command.
 
+## Crashes and risks
+
+On a laptop that runs long GPU jobs, "the machine rebooted" has several unrelated causes, and VRAM
+contention between jobs is only one of them. Two commands, both read-only, tell them apart. They read
+what Windows already recorded; nothing is installed, and no setting, driver or process is touched.
+
+### `vramorama crashes`
+
+Reads the System and Application event logs (through `wevtapi.dll`, loaded at run time like the other
+Windows libraries) and builds one incident per unexpected reboot:
+
+- **When it stopped.** Kernel-Power 41 is only written at the next boot. The time the machine was last
+  alive is in the payload of EventLog 6008, so that is the crash time.
+- **What the bugcheck was.** The code and parameters from Kernel-Power 41 and WER 1001 decoded by name
+  (`0x10E VIDEO_MEMORY_MANAGEMENT_INTERNAL`, `0x116 VIDEO_TDR_FAILURE`, `0x117`, `0x119`, `0x3B`, `0x1A`,
+  `0x50`, `0x124`, `0x9F`, `0xEF`, and others), the exception behind a `0x3B`, the minidump path, and
+  **the module and function** the Windows Error Reporting fault bucket names
+  (`AV_nvlddmkm!UvmChannelUpdateProgress`). No bugcheck at all means a hang or power loss.
+- **Whether the machine was in Modern Standby.** Kernel-Power 41 records `ConnectedStandbyInProgress`,
+  and Kernel-Power 506/507 say since when. A standby entered and never exited before the crash is
+  reported as a crash *while resuming*.
+- **GPU resets before it.** `nvlddmkm` 153, `Display`/`amdkmdag` 4101, and the `LiveKernelEvent` reports
+  (0x117 and 0x141, GPU hangs Windows recovered from) in the ten minutes before. A reset logs three events
+  within a second or two; they count once.
+- **What held the GPU and RAM.** If a `watch --log` file covers the time (`--log FILE`, or any `.jsonl`
+  in `~\.vramorama`), the incident shows the card, RAM and commit charge in the five minutes before, and
+  which sessions held how much. `watch` logs write a `system` object (RAM and commit) from 0.11; older logs
+  still give the card and the holders.
+
+```text
+> vramorama crashes --last 1
+Crash forensics, last 30 days (System and Application event logs)
+13 unexpected reboot(s): 9 blue screen(s), 4 with no bugcheck (hang or power loss)
+Verdicts: 6 standby, 4 gpu-fault, 2 hard-hang, 1 tdr-cascade
+6 of 13 happened while the machine was in Modern Standby or asleep
+GPU resets and hangs logged: 56 x GPU reset event, 24 x GPU timeout (0x117), 14 x GPU engine timeout (0x141); ...
+
+2026-10-19 06:03  blue screen 0x3B SYSTEM_SERVICE_EXCEPTION, access violation
+  blamed:   nvlddmkm!UvmChannelUpdateProgress (NVIDIA display driver)
+  power:    in Modern Standby since 2026-10-19 01:18 (4h44m before the crash)
+  GPU:      no GPU resets in the 10m before
+  watch:    no watch log (record one with `vramorama watch --quiet --log FILE`)
+  dump:     C:\Windows\Minidump\101926-21421-01.dmp
+  verdict:  [standby] GPU driver fault 4h44m after it entered Modern Standby (screen off). Display-off power
+            management is the trigger, not VRAM contention. ...
+```
+
+With a watch log that covers the crash, the `watch:` line becomes the state of the machine just before it,
+and the verdict can change:
+
+```text
+  watch:    40 sample(s), last 5s before: card 15,700 of 15,915 MiB (peak 15,700), commit 95%, RAM free min 700 MiB
+            held by: claude 11111111 9,000 MiB; chatgpt 22222222 6,500 MiB
+            spilled to system memory: pid 4242 2,400 MiB
+  verdict:  [memory-pressure] memory pressure before the crash (2,400 MiB spilled from the card into system
+            memory; commit charge reached 95% of the commit limit; the card was full ...
+```
+
+Each incident ends in a verdict. They are tried in this order, and the first that the evidence supports wins:
+
+| Verdict | Means |
+|---|---|
+| `memory-pressure` | The watch log shows spill into shared GPU memory, commit charge at 92% of its limit or more, under 512 MiB of free RAM, or a full card with two or more jobs. Contention is a credible cause. |
+| `standby` | Modern Standby (or sleep) was in progress, or the crash came as the machine resumed, and the failure is a GPU, driver or power one or no bugcheck. The trigger is display-off power management, not the workload. |
+| `tdr-cascade` | Two or more GPU resets in the ten minutes before. |
+| `single-workload` | A GPU or display-driver fault with at most one job on the card and no spill or commit pressure: not contention. Needs a watch log. |
+| `gpu-fault` | A GPU or display-driver fault without a log that settles whether the card was shared (or with several jobs but no pressure). |
+| `hard-hang`, `forced-power-off` | No bugcheck was written (the power button had been held, for the second). A freeze with no dump points at the GPU, firmware or power delivery. |
+| `other-bugcheck` | A bugcheck that is not about the graphics stack (memory, hardware, power transitions of other devices). |
+
+To have the minutes before the next crash on record, keep a watcher running (each sample is flushed to the file as it is taken):
+`vramorama watch --quiet --interval 5 --log $HOME\.vramorama\watch.jsonl`. `crashes --json` has every field,
+`--days N` sets the window (default 30) and `--last N` the incidents listed (default 10).
+
+### `vramorama doctor`
+
+Checks the things that make those crashes likelier and says what to do about each. It never changes a
+setting:
+
+- **Screen-off and sleep timeouts** (`powrprof.dll`, the active plan, on AC and on battery) on a machine
+  with **Modern Standby** (`CallNtPowerInformation`). On such a machine a screen-off timeout starts Modern
+  Standby even when sleep is set to Never, and the GPU is power-gated while a job keeps running. Escalates
+  to a risk when `crashes` found reboots in standby.
+- **The display driver's version, release and age** from the registry, for every adapter (an NVIDIA
+  `32.0.15.7705` is release 577.05).
+- **Commit charge against its limit and free RAM**: the "going into swap" case.
+- **Spill** into shared GPU memory, and the **power cap**, as in [Spill](#spill) and
+  [Power cap](#power-cap).
+- **GPU resets** in the last 24 hours and 7 days, and the crash record.
+
+`--json` has the same findings; the [GUI](#the-gui) shows them as a **Crashes and risks** card.
+
+### Staying out of Modern Standby while a job runs
+
+`vramorama run` now asks Windows to keep the machine awake from admission until the job (and any
+`--restart`) ends: `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`. It
+changes no power setting or plan, Windows drops the request when the process ends however it ends, and the
+job is never touched. The screen stays on, because the screen turning off is what starts Modern Standby on
+these laptops; `--allow-display-off` holds only the system (the screen may switch off, and some machines
+then enter standby anyway) and `--no-keep-awake` asks for nothing. A `--detach`ed job outlives `run`, so
+nothing holds the machine awake for it.
+
+`run` also waits, instead of starting, while the system commit charge is at or above `--max-commit PCT`
+of its limit (default 92, `0` turns it off): a job that grows from there pushes the machine into swap, and
+an allocation that fails inside a driver is a blue screen rather than an error message.
+
 ## How it works
 
 - **Memory and utilisation:** the `GPU Process Memory(*)\Dedicated Usage`, `GPU Engine(*)\Utilization
@@ -496,8 +607,8 @@ stays with whoever runs the command.
 vramorama has **no dependencies**: `[dependencies]` is empty, `Cargo.lock` lists only vramorama,
 and there is no `build.rs` and there are no proc macros. `cargo build --locked --offline` works on a
 machine that has never contacted a registry. Windows APIs are declared by hand; only `kernel32` is
-linked, and `pdh.dll`, `dxgi.dll` and `ntdll.dll` are resolved at run time, so no binding crates or
-import libraries are involved. All `unsafe` code is in `src/sys.rs`, `src/gpu.rs`, `src/procs.rs` and the two Windows calls in `src/gui.rs` (the system RNG and opening the browser).
+linked, and `pdh.dll`, `dxgi.dll`, `ntdll.dll`, `wevtapi.dll`, `powrprof.dll`, `advapi32.dll` and `nvml.dll` are resolved at run time, so no binding crates or
+import libraries are involved. All `unsafe` code is in `src/sys.rs`, `src/gpu.rs`, `src/procs.rs`, `src/evt.rs`, `src/sysinfo.rs` and the two Windows calls in `src/gui.rs` (the system RNG and opening the browser).
 The WMI fallback of `run --detach` calls the Windows PowerShell that ships with Windows. The CI
 workflow uses no third-party actions (it checks out with plain `git`).
 
@@ -516,6 +627,11 @@ workflow uses no third-party actions (it checks out with plain `git`).
   more than 512 MiB of pinned host buffers on a nearly full card is reported as spilled too.
 - A server that waits idle between requests (an inference server between evaluation batches) is
   *idle* by these rules. The verdict only says nobody appears to own it, not that nobody uses it.
+- `crashes` reads what Windows logged. It can name the module a fault bucket names and say what ran
+  just before, but it does not open the minidump: for the exact call stack use WinDbg on the path it prints. Event logs
+  roll over, so old crashes disappear; Windows writes the bucket (and so the blamed module) a minute or two after the
+  reboot, and not always. The verdict is a reading of the evidence, not a proof: a standby fault and measured memory
+  pressure can both be true, and the first matching verdict is reported.
 - A job that allocates more than its lease asked for is not stopped; the excess simply counts as in
   use for everyone else.
 - Processes running elevated or as another user need an elevated vramorama to read their
@@ -530,9 +646,11 @@ workflow uses no third-party actions (it checks out with plain `git`).
 
 ## Roadmap
 
-1. A WSL client on the same ledger, so jobs inside WSL queue with Windows ones.
-2. Server awareness for `idle`: open client connections on a listening port count as use.
-3. An MCP server for agents, and the Linux/NVML backend.
+1. Read the minidump itself (bugcheck parameters decoded per code, the faulting stack) and the
+   LiveKernelReports, and a flight recorder the GUI can write on its own (a rolling watch log).
+2. A WSL client on the same ledger, so jobs inside WSL queue with Windows ones.
+3. Server awareness for `idle`: open client connections on a listening port count as use.
+4. An MCP server for agents, and the Linux/NVML backend.
 
 ## License
 

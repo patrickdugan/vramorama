@@ -550,6 +550,10 @@ fn handle(mut stream: TcpStream, shared: &Mutex<Shared>, token: &str, host_ok: &
             };
             respond(&mut stream, 200, "application/json", body.as_bytes())
         }
+        "/api/health" => {
+            let body = health().to_string();
+            respond(&mut stream, 200, "application/json", body.as_bytes())
+        }
         "/api/trace" => {
             let Some(pid) = param("pid").and_then(|p| p.parse::<u32>().ok()) else {
                 return respond(&mut stream, 400, "text/plain", b"pid required");
@@ -562,6 +566,21 @@ fn handle(mut stream: TcpStream, shared: &Mutex<Shared>, token: &str, host_ok: &
         }
         _ => respond(&mut stream, 404, "text/plain", b"not found"),
     }
+}
+
+/// The risk checks and recent crashes: reading the event log takes about a second, and nothing in it changes
+/// quickly, so the answer is kept for two minutes.
+fn health() -> Value {
+    static CACHE: Mutex<Option<(std::time::Instant, Value)>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((at, v)) = cache.as_ref() {
+        if at.elapsed() < Duration::from_secs(120) {
+            return v.clone();
+        }
+    }
+    let v = crate::forensics::health_json();
+    *cache = Some((std::time::Instant::now(), v.clone()));
+    v
 }
 
 fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) -> std::io::Result<()> {

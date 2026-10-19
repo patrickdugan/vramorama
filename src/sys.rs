@@ -89,6 +89,19 @@ pub struct MemoryStatusEx {
     pub avail_extended_virtual: u64,
 }
 
+/// SYSTEM_POWER_STATUS.
+#[repr(C)]
+#[derive(Default)]
+pub struct SystemPowerStatus {
+    /// 0 on battery, 1 on AC, 255 unknown.
+    pub ac_line_status: u8,
+    pub battery_flag: u8,
+    pub battery_life_percent: u8,
+    pub system_status_flag: u8,
+    pub battery_life_time: u32,
+    pub battery_full_life_time: u32,
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     pub fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
@@ -118,6 +131,9 @@ unsafe extern "system" {
     pub fn GetConsoleMode(h: Handle, mode: *mut u32) -> i32;
     pub fn SetConsoleMode(h: Handle, mode: u32) -> i32;
     pub fn GetConsoleScreenBufferInfo(h: Handle, info: *mut ConsoleScreenBufferInfo) -> i32;
+    pub fn SetThreadExecutionState(flags: u32) -> u32;
+    pub fn GetSystemPowerStatus(status: *mut SystemPowerStatus) -> i32;
+    pub fn LocalFree(mem: *mut c_void) -> *mut c_void;
 }
 
 /// NUL-terminated UTF-16 for passing to `W` functions.
@@ -248,5 +264,100 @@ pub fn console() -> Option<usize> {
             return None;
         }
         Some((info.window[2] - info.window[0] + 1).max(40) as usize)
+    }
+}
+
+/// "2026-10-19 06:03" in local time, from a Unix time.
+pub fn fmt_local_unix(secs: f64) -> String {
+    let t = system_time(unix_to_filetime(secs), true);
+    format!("{:04}-{:02}-{:02} {:02}:{:02}", t.year, t.month, t.day, t.hour, t.minute)
+}
+
+/// Whether the machine runs on AC power, when Windows says.
+pub fn on_ac_power() -> Option<bool> {
+    let mut s = SystemPowerStatus::default();
+    if unsafe { GetSystemPowerStatus(&mut s) } == 0 {
+        return None;
+    }
+    match s.ac_line_status {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+pub const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+pub const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
+pub const ES_CONTINUOUS: u32 = 0x8000_0000;
+
+/// What a running job asks of the power manager.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Awake {
+    /// Ask for nothing.
+    Off,
+    /// The machine must not go to sleep or idle into Modern Standby; the screen may still switch off.
+    System,
+    /// As `System`, and the screen stays on. Screen-off is what starts Modern Standby on most laptops.
+    SystemAndDisplay,
+}
+
+/// A request that the machine stay awake, held until dropped (`SetThreadExecutionState` with
+/// `ES_CONTINUOUS`). It changes no power setting and no power plan: Windows forgets the request when
+/// this thread ends, whatever the exit path, and an explicit `ES_CONTINUOUS` call on drop withdraws it
+/// earlier. The request belongs to the thread that made it, so keep the guard on that thread.
+pub struct KeepAwake(Awake);
+
+impl KeepAwake {
+    pub fn hold(how: Awake) -> KeepAwake {
+        if let Some(flags) = Self::flags(how) {
+            unsafe { SetThreadExecutionState(flags) };
+        }
+        KeepAwake(how)
+    }
+
+    fn flags(how: Awake) -> Option<u32> {
+        match how {
+            Awake::Off => None,
+            Awake::System => Some(ES_CONTINUOUS | ES_SYSTEM_REQUIRED),
+            Awake::SystemAndDisplay => Some(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED),
+        }
+    }
+}
+
+impl Drop for KeepAwake {
+    fn drop(&mut self) {
+        if self.0 != Awake::Off {
+            unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The state this thread holds, read by setting the same continuous state again (the call returns the previous one).
+    fn held_now() -> u32 {
+        let prev = unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+        // Put back what was there.
+        unsafe { SetThreadExecutionState(prev) };
+        prev & !ES_CONTINUOUS
+    }
+
+    #[test]
+    fn keep_awake_holds_and_releases_on_this_thread() {
+        assert_eq!(held_now(), 0);
+        {
+            let _g = KeepAwake::hold(Awake::SystemAndDisplay);
+            assert_eq!(held_now(), ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+        }
+        assert_eq!(held_now(), 0);
+        {
+            let _g = KeepAwake::hold(Awake::System);
+            assert_eq!(held_now(), ES_SYSTEM_REQUIRED);
+        }
+        assert_eq!(held_now(), 0);
+        let _g = KeepAwake::hold(Awake::Off);
+        assert_eq!(held_now(), 0);
     }
 }

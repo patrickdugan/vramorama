@@ -8,6 +8,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::doctor;
 use crate::gpu::{self, Sampler};
 use crate::ledger::{self, LEASE_VAR, Lease, State};
 use crate::owner::{LABEL_VAR, Owner};
@@ -39,6 +40,10 @@ pub struct RunOpts {
     pub quiet: bool,
     /// Never let a request go ahead of an earlier one (no backfill).
     pub strict_fifo: bool,
+    /// Do not admit while the system commit charge is at or above this percentage of its limit (0: no limit).
+    pub max_commit_pct: u32,
+    /// What the running job asks of the power manager (see `sys::KeepAwake`).
+    pub awake: crate::sys::Awake,
     /// Opt-in supervision of the job this process starts (restart, power guard, VRAM enforcement).
     pub policy: crate::guard::Policy,
     pub argv: Vec<String>,
@@ -95,6 +100,8 @@ struct View {
     procs: Vec<(u32, u64)>,
     /// Board power and limits from NVML, for an NVIDIA card.
     power: Option<crate::power::PowerState>,
+    /// System commit charge and its limit, in MiB.
+    commit: Option<(u64, u64)>,
 }
 
 fn observe(sampler: &mut Sampler, scanner: &mut Scanner, card: &Card) -> View {
@@ -133,6 +140,8 @@ fn observe(sampler: &mut Sampler, scanner: &mut Scanner, card: &Card) -> View {
         } else {
             None
         },
+        commit: procs::system_memory()
+            .map(|m| (m.commit_limit.saturating_sub(m.commit_avail) / MIB, m.commit_limit / MIB)),
     }
 }
 
@@ -302,6 +311,13 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
                     "power-capped ({:.0} W enforced against a {:.0} W default); not admitting anything until it clears",
                     w.enforced_w, w.default_w
                 ))
+            } else if let Some(why) =
+                view.commit.and_then(|(used, limit)| doctor::commit_gate(used, limit, o.max_commit_pct))
+            {
+                // Near the commit limit a job that grows pushes the machine into swap, and a failed allocation
+                // inside a driver is a blue screen rather than an error message.
+                fits_since = None;
+                Some(format!("{why}; not admitting anything until it drops"))
             } else if if o.strict_fifo {
                 ledger::may_admit(&me, &leases, avail)
             } else {
@@ -377,6 +393,15 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
         );
     }
 
+    // From admission to the end of the job (including restarts), keep the machine from idling into Modern
+    // Standby. A detached job outlives this process, so this cannot cover it. Dropped on every exit path.
+    let _awake = (!o.detach).then(|| crate::sys::KeepAwake::hold(o.awake));
+    if !o.detach && !o.quiet && o.awake != crate::sys::Awake::Off {
+        eprintln!(
+            "vramorama: holding the machine {} while the job runs (no setting changes; --no-keep-awake opts out)",
+            if o.awake == crate::sys::Awake::System { "awake" } else { "awake with the screen on" }
+        );
+    }
     let mut tags = vec![(LEASE_VAR, me.id.clone())];
     if let Some(owner) = &o.owner {
         tags.push((LABEL_VAR, owner.clone()));

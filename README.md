@@ -312,6 +312,13 @@ lease 234228b0 pid 42620 (started through WMI, outside this session)
   system memory (see [Spill](#spill)), processes are taking turns on it (see [Thrash](#thrash)), or
   an NVIDIA card is power-capped (see [Power cap](#power-cap)), nothing is admitted. Nor is anything
   while the system commit charge is at or above `--max-commit` percent of its limit (default 92).
+  When several of these hold at once, the waiting line names all of them, and whether the request
+  would still have to wait for memory or its turn once they clear.
+- **Every check is a fresh reading.** A waiting lease reads the card every 2 s, and at once when
+  Windows reports a power change: AC or battery, the power plan, the power mode, battery or energy
+  saver, the lid, the display going off or on, sleep and resume (see [Power cap](#power-cap)). Each
+  waiting line says when its readings were taken (`as of 12:02:49`), and a line that has not changed
+  is printed again every minute, so the last line of a log is at most a minute old while `run` waits.
 - **The lease tag.** The job runs with `VRAMORAMA_LEASE=<id>` (and `VRAMORAMA_OWNER` with
   `--owner`), inherited by everything it starts, so memory is counted against the lease through
   launcher shims and worker processes. The lease ends when the job and every process carrying the
@@ -395,11 +402,37 @@ shows about 200 MHz even while the card draws 100 W.
 
 ```text
 > vramorama power
-NVIDIA GeForce RTX 5080 Laptop GPU: drawing 17 W at 100% use; enforced limit 15 W, default limit 80 W: CAPPED
+NVIDIA GeForce RTX 5080 Laptop GPU: drawing 22 W at 100% use; enforced limit 15 W, default limit 80 W: CAPPED
+  read from NVML at 2026-10-21 12:28:43; clock events: sw_power_cap
 ```
+
+The clock event reasons (`nvmlDeviceGetCurrentClocksEventReasons`) are shown for context only:
+`sw_power_cap` is set whenever the card draws up to its enforced limit, whatever that limit is, so it
+does not decide anything.
 
 `ps` and `leases` print a warning, `leases --json` has a `power` object, and `run` admits nothing
 while a card is capped. A job that is already running is not touched: vramorama stops nothing itself.
+
+The cap comes and goes. On 2026-10-21, on AC power in the Balanced plan with the power mode at its
+best-performance end, the same card read 15 W at 12:01, 137 W at 12:05, 150 W at 12:07 and 15 W
+again at 12:10. Nothing is cached: every check of a waiting `run` initialises NVML and reads the
+limits afresh, every 2 s, and at once when Windows reports a power event. Those come from
+`powrprof.dll` in its callback form (no window and no message loop): `PowerSettingRegisterNotification`
+for the power source, the active plan, the display state, battery saver, energy saver and the lid;
+`PowerRegisterForEffectivePowerModeNotifications` for the power mode; and
+`PowerRegisterSuspendResumeNotification` for sleep and resume. Subscribing changes no setting. A
+check that comes 30 s or more later than planned is logged too, since that means the machine slept or
+the process was suspended. Each change of the cap is logged with the time, the NVML reading and what
+prompted the check:
+
+```text
+vramorama: 2026-10-21 12:28:45 lease 02261ee0: power-capped at the first check: enforced limit 15 W against a 80 W default, drawing 22 W at 100% use, clock events: sw_power_cap (NVML)
+vramorama: lease 02261ee0 waits for 64 MiB on NVIDIA GeForce RTX 5080 Laptop GPU (as of 12:28:45): power-capped (15 W enforced against a 80 W default, read from NVML); not admitting anything until it clears
+vramorama: lease 02261ee0 waits for 64 MiB on NVIDIA GeForce RTX 5080 Laptop GPU (as of 12:29:48): power-capped (15 W enforced against a 80 W default, read from NVML); also system commit charge is 92% of its limit (58,773 of 63,729 MiB; the limit is 92%); not admitting anything until both clear
+```
+
+A supervised run (`--guard-power`, `--restart`) logs the same changes while its job runs, and its
+wait for a cap to clear before a restart checks again at once on a power event.
 
 ## Thrash
 

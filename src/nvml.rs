@@ -1,6 +1,9 @@
 //! Board power from NVML (`nvml.dll`, which ships with the NVIDIA driver in System32), resolved at
 //! run time like the other Windows libraries here. Only power is read: under WDDM NVML cannot
 //! report per-process memory (see `gpu.rs`), but board power and the power limits work.
+//!
+//! Nothing is cached: every call loads the library (already mapped after the first), initialises
+//! NVML, reads, and shuts it down again, so each reading is the driver's value at that moment.
 
 use std::ffi::c_void;
 
@@ -14,6 +17,7 @@ type HandleByIndex = unsafe extern "system" fn(u32, *mut *mut c_void) -> i32;
 type Name = unsafe extern "system" fn(*mut c_void, *mut u8, u32) -> i32;
 type Milliwatts = unsafe extern "system" fn(*mut c_void, *mut u32) -> i32;
 type Utilization = unsafe extern "system" fn(*mut c_void, *mut [u32; 2]) -> i32;
+type Reasons = unsafe extern "system" fn(*mut c_void, *mut u64) -> i32;
 
 const NVML_SUCCESS: i32 = 0;
 
@@ -37,6 +41,10 @@ pub fn read() -> Vec<PowerState> {
             lib.get::<Milliwatts>("nvmlDeviceGetPowerManagementDefaultLimit"),
             lib.get::<Utilization>("nvmlDeviceGetUtilizationRates"),
         );
+        // Renamed from "throttle" to "event" reasons in driver 535; same signature and bits.
+        let reasons = lib
+            .get::<Reasons>("nvmlDeviceGetCurrentClocksEventReasons")
+            .or_else(|| lib.get::<Reasons>("nvmlDeviceGetCurrentClocksThrottleReasons"));
         if init() != NVML_SUCCESS {
             return Vec::new();
         }
@@ -65,12 +73,16 @@ pub fn read() -> Vec<PowerState> {
                     Some(f) if f(h, &mut u) == NVML_SUCCESS => u[0],
                     _ => 0,
                 };
+                let mut bits = 0u64;
+                let clock_events = reasons.filter(|f| f(h, &mut bits) == NVML_SUCCESS).map(|_| bits);
                 out.push(PowerState {
                     name: label,
                     draw_w: mw(usage),
                     enforced_w: mw(enforced),
                     default_w: mw(default),
                     util_pct,
+                    clock_events,
+                    read_at: crate::sys::filetime_to_unix(crate::sys::now_filetime()),
                 });
             }
         }

@@ -3,6 +3,7 @@
 // Off Windows only `report` exists, so most of the shared code is unused there.
 #![cfg_attr(not(windows), allow(dead_code))]
 
+mod admit;
 mod crash;
 mod doctor;
 mod guard;
@@ -36,6 +37,8 @@ mod gpu;
 mod gui;
 #[cfg(windows)]
 mod nvml;
+#[cfg(windows)]
+mod powerwatch;
 #[cfg(windows)]
 mod procs;
 #[cfg(windows)]
@@ -82,7 +85,10 @@ USAGE
       children exit. A small request may go ahead of a larger one that cannot start yet, if
       the larger one would still fit afterwards (--strict-fifo turns that off). Nothing is
       admitted while the card is power-capped (see `power`) or the system commit charge is at
-      or above --max-commit PCT of its limit (default 92; 0 turns that off). While the job runs
+      or above --max-commit PCT of its limit (default 92; 0 turns that off). Every check reads
+      the card afresh, every 2 s and at once when Windows reports a power change (AC or battery,
+      plan, power mode, display, lid, sleep and resume); a waiting line names every condition
+      that blocks, with the time it was read, and is repeated each minute. While the job runs
       `run` asks Windows to keep the machine awake and the screen on, so it does not drop into
       Modern Standby mid-job (a frequent trigger of the crashes `crashes` finds); that changes
       no setting and ends with the job. --allow-display-off lets the screen switch off,

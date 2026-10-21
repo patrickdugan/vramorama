@@ -273,6 +273,18 @@ pub fn fmt_local_unix(secs: f64) -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}", t.year, t.month, t.day, t.hour, t.minute)
 }
 
+/// "2026-10-19 06:03:07" in local time, from a Unix time.
+pub fn fmt_local_secs(secs: f64) -> String {
+    let t = system_time(unix_to_filetime(secs), true);
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", t.year, t.month, t.day, t.hour, t.minute, t.second)
+}
+
+/// "06:03:07" in local time, from a Unix time.
+pub fn fmt_clock(secs: f64) -> String {
+    let t = system_time(unix_to_filetime(secs), true);
+    format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second)
+}
+
 /// Whether the machine runs on AC power, when Windows says.
 pub fn on_ac_power() -> Option<bool> {
     let mut s = SystemPowerStatus::default();

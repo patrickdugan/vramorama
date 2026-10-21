@@ -8,11 +8,12 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::doctor;
+use crate::admit;
 use crate::gpu::{self, Sampler};
 use crate::ledger::{self, LEASE_VAR, Lease, State};
 use crate::owner::{LABEL_VAR, Owner};
 use crate::parse::{base64, duration, ellipsize, join_args, thousands};
+use crate::power::{Cap, CapTracker, PowerState};
 use crate::procs;
 use crate::scan::Scanner;
 
@@ -224,6 +225,83 @@ fn unix_now() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
 
+/// Follows the card's power cap from one check to the next for a lease: logs each change (capped to
+/// not capped and back) with the time, the NVML reading and what prompted the check; logs the Windows
+/// power events that cut a wait short; and notices when the machine slept between two checks.
+struct PowerLog {
+    lease: String,
+    quiet: bool,
+    cap: CapTracker,
+    last_check: Option<f64>,
+    /// The planned time between the last check and the next.
+    interval: Duration,
+    /// What prompted the next check, for the log.
+    why: String,
+}
+
+impl PowerLog {
+    fn new(lease: &str, quiet: bool) -> PowerLog {
+        PowerLog {
+            lease: lease.to_string(),
+            quiet,
+            cap: CapTracker::default(),
+            last_check: None,
+            interval: POLL,
+            why: "the first check".into(),
+        }
+    }
+
+    /// After each fresh reading.
+    fn check(&mut self, power: Option<&PowerState>, now: f64) {
+        if let Some(gap) = admit::gap(self.last_check, now, self.interval.as_secs_f64()) {
+            self.why = format!("a {} gap since the previous check", duration(gap));
+            if !self.quiet {
+                eprintln!(
+                    "vramorama: {} lease {}: {} since the previous check (the machine slept or this process was suspended); checking the card again now",
+                    crate::sys::fmt_local_secs(now),
+                    self.lease,
+                    duration(gap)
+                );
+            }
+        }
+        self.last_check = Some(now);
+        let change = self.cap.update(now, Cap::of(power));
+        if let Some(line) = crate::power::change_line(change, power, &self.why).filter(|_| !self.quiet) {
+            let at = power.map_or(now, |p| p.read_at);
+            eprintln!("vramorama: {} lease {}: {line}", crate::sys::fmt_local_secs(at), self.lease);
+        }
+    }
+
+    /// Wait `d` before the next check, or less when Windows reports a power event.
+    fn pause(&mut self, d: Duration) {
+        self.interval = d;
+        let events = crate::powerwatch::wait(d);
+        if events.is_empty() {
+            self.why = "the regular check".into();
+            return;
+        }
+        let list: Vec<&str> = events.iter().map(|e| e.what.as_str()).collect();
+        self.why = format!("Windows: {}", list.join(", "));
+        if !self.quiet {
+            for e in &events {
+                eprintln!(
+                    "vramorama: {} lease {}: Windows reports {}; checking the card again now",
+                    crate::sys::fmt_local_secs(e.at),
+                    self.lease,
+                    e.what
+                );
+            }
+        }
+    }
+
+    /// After a deliberate wait that did not go through `pause` (the restart cool-down), so it does
+    /// not read as sleep.
+    fn after_pause(&mut self) {
+        self.last_check = None;
+        self.why = "the end of the restart cool-down".into();
+    }
+}
+
 /// Returns the job's exit code (attached), or 0 once a detached job has started.
 pub fn run(o: &RunOpts) -> Result<i32, String> {
     let root =
@@ -266,10 +344,18 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
     let start = Instant::now();
     // When the request first fitted, and the committed memory (in use plus reservations) then.
     let mut fits_since: Option<(Instant, u64)> = None;
-    let mut last_note = String::new();
+    let mut notes = admit::NoteLog::default();
+    let mut plog = PowerLog::new(&me.id, o.quiet);
+    // Windows power events cut the wait between checks short. Kept while `run` still checks the card.
+    let watch = crate::powerwatch::Watch::start();
+    if watch.subscriptions() == 0 && !o.quiet {
+        eprintln!("vramorama: lease {}: no Windows power notifications here; the card is checked every 2 s", me.id);
+    }
     let mut thrash = crate::thrash::Detector::new(60.0);
     loop {
         let view = observe(&mut sampler, &mut scanner, &card);
+        let read_at = unix_now();
+        plog.check(view.power.as_ref(), read_at);
         thrash.push(
             card.luid,
             unix_now(),
@@ -287,42 +373,21 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
             let outstanding = ledger::outstanding(&leases, &view.by_lease, unix_now());
             let avail = ledger::available(card.total_mib, view.used_mib, outstanding, o.headroom_mib);
             let committed = view.used_mib + outstanding;
-            if !view.spills.is_empty() {
-                // The card is already over-committed: one more job only makes everything slower.
-                fits_since = None;
-                let mib: u64 = view.spills.iter().map(|(_, m)| m).sum();
-                Some(format!(
-                    "{} MiB has spilled into system memory (pid {}); not admitting anything until it clears",
-                    thousands(mib),
-                    view.spills.iter().map(|(p, _)| p.to_string()).collect::<Vec<_>>().join(", ")
-                ))
-            } else if let Some(t) = &thrashing {
-                // Processes are already taking turns on the card: another job would join the queue for it.
-                fits_since = None;
-                Some(format!(
-                    "pids {} are taking turns on the full card (thrashing); not admitting anything until it stops",
-                    t.procs.iter().map(|p| p.pid.to_string()).collect::<Vec<_>>().join(" and ")
-                ))
-            } else if let Some(w) = view.power.as_ref().filter(|p| p.capped()) {
-                // A capped card runs everything far slower and a long kernel can trip the 2 s Windows GPU
-                // timeout, which resets the card for every session: do not add a job now.
-                fits_since = None;
-                Some(format!(
-                    "power-capped ({:.0} W enforced against a {:.0} W default); not admitting anything until it clears",
-                    w.enforced_w, w.default_w
-                ))
-            } else if let Some(why) =
-                view.commit.and_then(|(used, limit)| doctor::commit_gate(used, limit, o.max_commit_pct))
-            {
-                // Near the commit limit a job that grows pushes the machine into swap, and a failed allocation
-                // inside a driver is a blue screen rather than an error message.
-                fits_since = None;
-                Some(format!("{why}; not admitting anything until it drops"))
-            } else if if o.strict_fifo {
+            let admissible = if o.strict_fifo {
                 ledger::may_admit(&me, &leases, avail)
             } else {
                 ledger::may_admit_backfill(&me, &leases, avail, card.total_mib.saturating_sub(o.headroom_mib))
-            } {
+            };
+            // Spill, thrash, a power cap and the commit charge each stop admission; all that apply are named,
+            // and so is this request's own wait behind them.
+            let blockers =
+                admit::blockers(&view.spills, thrashing.as_ref(), view.power.as_ref(), view.commit, o.max_commit_pct);
+            let then =
+                (!admissible).then(|| admit::then_waiting(o.vram_mib, avail, ledger::queue_position(&me, &leases)));
+            if let Some(note) = admit::blocked_note(&blockers, then.as_deref()) {
+                fits_since = None;
+                Some(note)
+            } else if admissible {
                 let (since, base) = *fits_since.get_or_insert_with(|| (Instant::now(), committed));
                 if ledger::still_growing(base, committed) {
                     // Something is still allocating, most likely a job started without a lease.
@@ -369,9 +434,15 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
             }
         };
         let Some(note) = waiting else { break };
-        if !o.quiet && note != last_note {
-            eprintln!("vramorama: lease {} waits for {} MiB on {}: {note}", me.id, thousands(o.vram_mib), card.name);
-            last_note = note;
+        // Printed when it changes and again every minute, with the time of the readings behind it.
+        if !o.quiet && notes.due(&note, read_at) {
+            eprintln!(
+                "vramorama: lease {} waits for {} MiB on {} (as of {}): {note}",
+                me.id,
+                thousands(o.vram_mib),
+                card.name,
+                crate::sys::fmt_clock(read_at)
+            );
         }
         if o.wait_secs.is_some_and(|w| start.elapsed().as_secs_f64() > w) {
             let _l = lock(&root)?;
@@ -382,7 +453,11 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
                 thousands(o.vram_mib)
             ));
         }
-        std::thread::sleep(POLL);
+        plog.pause(POLL);
+    }
+    // Only a supervised job is checked from here on; for anything else the subscriptions can end now.
+    if o.detach || !o.policy.supervised() {
+        drop(watch);
     }
     if !o.quiet {
         eprintln!(
@@ -436,7 +511,7 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
             Ok(0)
         }
         Started::Attached(child) => {
-            let code = supervise(&root, &mut me, o, &card, &tags, child, &mut sampler, &mut scanner)?;
+            let code = supervise(&root, &mut me, o, &card, &tags, child, &mut sampler, &mut scanner, &mut plog)?;
             let _l = lock(&root)?;
             ledger::remove(&root, &me.id);
             Ok(code)
@@ -468,6 +543,7 @@ fn supervise(
     mut child: Child,
     sampler: &mut Sampler,
     scanner: &mut Scanner,
+    plog: &mut PowerLog,
 ) -> Result<i32, String> {
     use crate::guard::{Ended, Verdict, Watch, should_restart};
     let policy = &o.policy;
@@ -484,6 +560,7 @@ fn supervise(
                 break st.code().unwrap_or(1);
             }
             let view = observe(sampler, scanner, card);
+            plog.check(view.power.as_ref(), unix_now());
             let capped = view.power.as_ref().is_some_and(|p| p.capped());
             let used = view.by_lease.get(&me.id).copied().unwrap_or(0);
             if stopped.is_none() {
@@ -509,7 +586,7 @@ fn supervise(
                     }
                 }
             }
-            std::thread::sleep(POLL);
+            plog.pause(POLL);
         };
         let ended = stopped.unwrap_or(Ended::Exit(code));
         // A GPU reset logged since the job started (a little before, for clock skew).
@@ -535,9 +612,11 @@ fn supervise(
             ledger::write(root, me)?;
         }
         std::thread::sleep(Duration::from_secs(RESTART_COOLDOWN_SECS));
+        plog.after_pause();
         let waited = Instant::now();
         loop {
             let view = observe(sampler, scanner, card);
+            plog.check(view.power.as_ref(), unix_now());
             match view.power.as_ref().filter(|p| p.capped()) {
                 None => break,
                 Some(p) if waited.elapsed() > RESTART_MAX_CAPPED => {
@@ -549,7 +628,8 @@ fn supervise(
                     );
                     return Ok(3);
                 }
-                Some(_) => std::thread::sleep(Duration::from_secs(30)),
+                // Checked again in 30 s, or at once when Windows reports a power change.
+                Some(_) => plog.pause(Duration::from_secs(30)),
             }
         }
         child = job_command(o, tags).spawn().map_err(|e| format!("could not restart {}: {e}", o.argv[0]))?;
@@ -653,6 +733,11 @@ pub fn power(json_out: bool, adapter: Option<&str>) -> Result<(), String> {
             p.enforced_w,
             p.default_w,
             if p.capped() { "CAPPED" } else { "ok" }
+        );
+        println!(
+            "  read from NVML at {}; clock events: {}",
+            crate::sys::fmt_local_secs(p.read_at),
+            crate::power::clock_events(p)
         );
         if let Some(w) = crate::power::warning(p) {
             println!("  WARNING {w}");

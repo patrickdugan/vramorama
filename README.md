@@ -357,13 +357,23 @@ vramorama run --vram 11G --restart 5 --guard-power 30 --enforce-vram 512 -- pyth
 
 - `--restart N` starts the job again, up to N times, after **a GPU reset** (a `nvlddmkm` 153,
   `amdkmdag` 4101 or `Display` 4101 event logged while the job ran, read with `wevtutil`) or a power-guard
-  stop. It waits 60 s, then until the card is no longer power-capped (an hour at most), and keeps the
-  lease meanwhile. The job must resume from its own checkpoint (`--auto-resume` here). An ordinary
-  failure, with no reset logged, is **not** retried, so a bug cannot loop; neither is a job stopped for
-  exceeding its lease.
+  stop. After a reset it waits 60 s. After a power-guard stop it waits 60 s and then until **nothing has
+  blocked for a stretch longer than the guard window** (1.5 times `--guard-power`, at least a minute): no
+  power cap, no memory spilled into RAM, and the commit charge under `--max-commit`. Each power-guard stop
+  in a row that came within 15 minutes of the start doubles that stretch (half an hour at most), and a run
+  that lasted longer starts the count over. Without this a cap that flickers off for one reading would
+  restart the job straight into the next cap, and every restart would be gone in minutes, each one loading
+  the whole job onto a scarce card and scarce RAM for nothing. It waits up to six hours. The reservation
+  is kept for the first 5 minutes of the wait and then given up, so a long wait does not hold the card
+  idle for others; the lease takes its place in the queue again (same position) when the card is clear.
+  While it waits, the log says what blocks and, once, which other devices exist and why they may not help
+  (an integrated GPU borrows the system memory that is already scarce; an NPU only runs compiled models;
+  a second discrete card can be chosen with `--adapter`). The job must resume from its own checkpoint
+  (`--auto-resume` here). An ordinary failure, with no reset logged, is **not** retried, so a bug cannot
+  loop; neither is a job stopped for exceeding its lease.
 - `--guard-power SECS` stops the job (and its process tree) after the card has been power-capped for SECS
   seconds. A capped card would run it twenty times slower and the next long kernel would reset the GPU
-  for everyone. With `--restart` it starts again when the cap clears.
+  for everyone. With `--restart` it starts again once the card has stayed clear (see `--restart`).
 - `--enforce-vram MIB` stops the job when its processes hold more than the lease plus MIB. Without it a
   job that allocates more than it asked for is not touched.
 

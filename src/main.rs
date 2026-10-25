@@ -99,6 +99,10 @@ USAGE
         --restart N          start the job again, up to N times, after a Windows GPU reset (a TDR
                              event logged while it ran) or a --guard-power stop; the job should
                              resume from its own checkpoint. Other failures are not retried.
+                             After a --guard-power stop it waits until nothing (power cap, spill,
+                             commit charge) has blocked for 1.5 guard windows, doubled for each
+                             fruitless stop in a row (30 min at most); it gives its reservation up
+                             after 5 min of waiting and queues again.
         --guard-power SECS   stop the job if the card stays power-capped for SECS seconds.
         --enforce-vram MIB   stop the job if it holds more than its lease plus MIB.
   vramorama power [--json] [--adapter NAME]

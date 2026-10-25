@@ -6,6 +6,7 @@
 //! every minute with the time of its new reading, so the last line of a log is never an old reading
 //! that only looks current.
 
+use crate::gpu::Adapter;
 use crate::parse::thousands;
 use crate::power::PowerState;
 use crate::thrash::Thrash;
@@ -86,6 +87,38 @@ pub fn blocked_note(blockers: &[String], then: Option<&str>) -> Option<String> {
         note.push_str(t);
     }
     Some(note)
+}
+
+/// Other places a job could go while this card is blocked, each with the reason it may not help. Printed
+/// once per wait, never acted on: moving a job to another device is the job's own business.
+///
+/// 2026-10-25: a 19 GB-commit job and a 12 GB-commit job were sharing a 16 GB card that Windows kept
+/// resetting, with 0.4 GB of RAM free. The other adapters on that machine were a 0.5 GB integrated GPU
+/// (shares system RAM) and an NPU (only runs compiled models), so neither was a way out.
+pub fn routing_hints(adapters: &[Adapter], card_luid: u64) -> Vec<String> {
+    const GIB: u64 = 1 << 30;
+    let mut out = Vec::new();
+    for a in adapters.iter().filter(|a| a.luid != card_luid && !a.software) {
+        if a.dedicated < GIB {
+            out.push(format!(
+                "{} is an integrated GPU that borrows system memory: it cannot run CUDA jobs, and a job moved there adds to the RAM and commit pressure instead of relieving it",
+                a.name
+            ));
+        } else {
+            out.push(format!(
+                "{} has {} GiB of its own: start the job with --adapter \"{}\" if its code can run there",
+                a.name,
+                a.dedicated / GIB,
+                a.name
+            ));
+        }
+    }
+    out.push(
+        "an NPU, if the machine has one, only runs models compiled for it (ONNX or the vendor's toolchain), not \
+PyTorch or CUDA code; the CPU runs small jobs but adds to RAM pressure"
+            .to_string(),
+    );
+    out
 }
 
 /// When to print a waiting note: when it changes, and again every `REPEAT_NOTE_SECS` while it does not.
@@ -196,6 +229,33 @@ clears; even then 6,144 MiB does not fit yet"
         // 40 W against 80 W is capped; 41 W is not (see power.rs).
         assert_eq!(blockers(&[], None, Some(&power(41.0)), None, 92), Vec::<String>::new());
         assert_eq!(blockers(&[], None, Some(&power(40.0)), None, 92).len(), 1);
+    }
+
+    fn adapter(luid: u64, name: &str, dedicated_mib: u64, software: bool) -> Adapter {
+        Adapter { luid, name: name.into(), vendor: 0, dedicated: dedicated_mib << 20, software }
+    }
+
+    #[test]
+    fn routing_hints_say_why_the_other_devices_do_not_help() {
+        let all = [
+            adapter(1, "NVIDIA GeForce RTX 5080 Laptop GPU", 16_303, false),
+            adapter(2, "AMD Radeon(TM) 880M Graphics", 512, false),
+            adapter(3, "Microsoft Basic Render Driver", 0, true),
+        ];
+        let h = routing_hints(&all, 1);
+        assert_eq!(h.len(), 2, "the card itself and the software adapter are not offered: {h:?}");
+        assert!(h[0].starts_with("AMD Radeon(TM) 880M Graphics is an integrated GPU that borrows system memory"), "{}", h[0]);
+        assert!(h[0].contains("adds to the RAM and commit pressure"), "{}", h[0]);
+        assert!(h[1].starts_with("an NPU, if the machine has one, only runs models compiled for it"), "{}", h[1]);
+    }
+
+    #[test]
+    fn a_second_discrete_card_is_offered_with_the_adapter_flag() {
+        let all = [adapter(1, "NVIDIA A", 16_000, false), adapter(2, "NVIDIA B", 24_576, false)];
+        let h = routing_hints(&all, 1);
+        assert_eq!(h[0], "NVIDIA B has 24 GiB of its own: start the job with --adapter \"NVIDIA B\" if its code can run there");
+        // Alone on the machine: only the general caveat is left.
+        assert_eq!(routing_hints(&all[..1], 1).len(), 1);
     }
 
     #[test]

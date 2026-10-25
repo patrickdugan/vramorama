@@ -85,6 +85,69 @@ pub fn should_restart(ended: Ended, gpu_reset: bool, restarts_left: u32) -> bool
     }
 }
 
+/// A power-guard stop sooner than this after the job started was not a fair try (the cap was most likely
+/// still on); a job that ran longer made progress, so its next stop starts the count over.
+pub const FAIR_RUN_SECS: f64 = 900.0;
+/// The longest the card is ever required to stay clear before a stopped job is started again.
+pub const MAX_CLEAR_SECS: f64 = 1800.0;
+
+/// How long the card has to stay free of every blocker before a stopped job is started again.
+///
+/// 2026-10-25: a job stopped by `--guard-power` was started again the moment one reading showed the cap
+/// lifted, the cap came back, and the guard stopped it again two minutes later: five restarts gone in
+/// fifteen minutes, each one loading the whole job onto a scarce card and scarce RAM for nothing. A
+/// restart should only follow a clear stretch longer than the guard's own window, and each fruitless stop
+/// in a row doubles that stretch.
+#[derive(Default)]
+pub struct Backoff {
+    streak: u32,
+}
+
+impl Backoff {
+    /// Record why the job ended and how long it had run.
+    pub fn note_end(&mut self, ended: Ended, ran_secs: f64) {
+        match ended {
+            Ended::PowerGuard if ran_secs < FAIR_RUN_SECS => self.streak += 1,
+            _ => self.streak = 0,
+        }
+    }
+
+    /// How long the card must stay clear before the next start. A stop by the power guard waits for one and
+    /// a half guard windows (at least a minute), doubled for each earlier fruitless stop in a row; other
+    /// endings (a GPU reset) need no clear stretch beyond the cool-down.
+    pub fn clear_needed(&self, p: &Policy, ended: Ended) -> f64 {
+        if ended != Ended::PowerGuard {
+            return 0.0;
+        }
+        let base = (p.guard_power_secs.unwrap_or(60.0) * 1.5).max(60.0);
+        let doublings = self.streak.saturating_sub(1).min(8);
+        (base * f64::from(1u32 << doublings)).min(MAX_CLEAR_SECS)
+    }
+}
+
+/// Starts a clock when nothing blocks and starts it over the moment something does.
+#[derive(Default)]
+pub struct ClearGate {
+    clear_since: Option<f64>,
+}
+
+impl ClearGate {
+    /// One look: `blocked` whether anything blocks right now. True once nothing has blocked for `need` seconds.
+    pub fn open(&mut self, now: f64, blocked: bool, need: f64) -> bool {
+        if blocked {
+            self.clear_since = None;
+            return false;
+        }
+        let since = *self.clear_since.get_or_insert(now);
+        now - since >= need
+    }
+
+    /// How long nothing has blocked, for the waiting line.
+    pub fn clear_for(&self, now: f64) -> f64 {
+        self.clear_since.map_or(0.0, |s| now - s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +196,71 @@ mod tests {
         assert!(should_restart(Ended::PowerGuard, false, 1));
         assert!(!should_restart(Ended::VramGuard, true, 5));
         assert!(!should_restart(Ended::PowerGuard, true, 0), "no restarts left");
+    }
+
+    #[test]
+    fn each_fruitless_power_stop_in_a_row_doubles_the_clear_stretch() {
+        // 2026-10-25: --guard-power 120, the job stopped every ~2 minutes because the cap kept coming back.
+        let p = Policy { guard_power_secs: Some(120.0), enforce_vram_slack_mib: None, restarts: 5 };
+        let mut b = Backoff::default();
+        assert_eq!(b.clear_needed(&p, Ended::PowerGuard), 180.0, "even the first stop waits longer than the guard window");
+        b.note_end(Ended::PowerGuard, 125.0);
+        assert_eq!(b.clear_needed(&p, Ended::PowerGuard), 180.0);
+        b.note_end(Ended::PowerGuard, 130.0);
+        assert_eq!(b.clear_needed(&p, Ended::PowerGuard), 360.0);
+        b.note_end(Ended::PowerGuard, 128.0);
+        assert_eq!(b.clear_needed(&p, Ended::PowerGuard), 720.0);
+        b.note_end(Ended::PowerGuard, 127.0);
+        assert_eq!(b.clear_needed(&p, Ended::PowerGuard), 1440.0);
+        for _ in 0..10 {
+            b.note_end(Ended::PowerGuard, 120.0);
+        }
+        assert_eq!(b.clear_needed(&p, Ended::PowerGuard), MAX_CLEAR_SECS, "never more than half an hour");
+    }
+
+    #[test]
+    fn a_long_run_or_another_ending_starts_the_count_over() {
+        let p = Policy { guard_power_secs: Some(120.0), enforce_vram_slack_mib: None, restarts: 5 };
+        let mut b = Backoff::default();
+        b.note_end(Ended::PowerGuard, 100.0);
+        b.note_end(Ended::PowerGuard, 100.0);
+        assert_eq!(b.clear_needed(&p, Ended::PowerGuard), 360.0);
+        // It ran for an hour before the cap came back: that was progress.
+        b.note_end(Ended::PowerGuard, 3600.0);
+        assert_eq!(b.clear_needed(&p, Ended::PowerGuard), 180.0);
+        b.note_end(Ended::PowerGuard, 100.0);
+        b.note_end(Ended::Exit(-1), 10.0);
+        assert_eq!(b.clear_needed(&p, Ended::PowerGuard), 180.0);
+    }
+
+    #[test]
+    fn a_gpu_reset_needs_no_clear_stretch_and_a_tiny_guard_window_still_waits_a_minute() {
+        let p = Policy { guard_power_secs: Some(10.0), enforce_vram_slack_mib: None, restarts: 3 };
+        let mut b = Backoff::default();
+        assert_eq!(b.clear_needed(&p, Ended::Exit(-1073740791)), 0.0);
+        assert_eq!(b.clear_needed(&p, Ended::PowerGuard), 60.0);
+        // No guard window at all (--restart alone, then only a reset can end it): the floor still applies.
+        let none = Policy { guard_power_secs: None, enforce_vram_slack_mib: None, restarts: 3 };
+        assert_eq!(b.clear_needed(&none, Ended::PowerGuard), 90.0);
+        b.note_end(Ended::PowerGuard, 5.0);
+        assert_eq!(b.clear_needed(&none, Ended::PowerGuard), 90.0);
+    }
+
+    #[test]
+    fn the_gate_opens_only_after_an_unbroken_clear_stretch() {
+        let mut g = ClearGate::default();
+        assert!(!g.open(0.0, true, 180.0));
+        assert!(!g.open(10.0, false, 180.0), "the clock starts at the first clear reading");
+        assert!(!g.open(100.0, false, 180.0));
+        // The cap came back for one reading: the stretch starts over.
+        assert!(!g.open(130.0, true, 180.0));
+        assert_eq!(g.clear_for(130.0), 0.0);
+        assert!(!g.open(160.0, false, 180.0));
+        assert!(!g.open(339.0, false, 180.0));
+        assert!(g.open(340.0, false, 180.0));
+        assert_eq!(g.clear_for(340.0), 180.0);
+        // Needing nothing opens it on the first clear reading.
+        let mut now = ClearGate::default();
+        assert!(now.open(5.0, false, 0.0));
     }
 }

@@ -26,8 +26,12 @@ const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 const POLL: Duration = Duration::from_secs(2);
 /// Pause before a supervised job is started again, so a reset card can settle.
 const RESTART_COOLDOWN_SECS: u64 = 60;
-/// How long a restart waits for a power cap to clear before giving up.
-const RESTART_MAX_CAPPED: Duration = Duration::from_secs(3600);
+/// How long a restart waits for the card to be clear (no power cap, spill or commit pressure) before giving
+/// up. Generous on purpose: a lease that has given up its reservation costs the others nothing.
+const RESTART_MAX_WAIT: Duration = Duration::from_secs(6 * 3600);
+/// A job that is down keeps its reserved memory this long; after that the reservation is given up, so a
+/// long wait for a power cap does not hold a scarce card idle, and the job queues again like anyone else.
+const HOLD_RESERVATION: Duration = Duration::from_secs(300);
 
 pub struct RunOpts {
     pub vram_mib: u64,
@@ -530,6 +534,31 @@ fn kill_tree(pid: u32) {
     let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output();
 }
 
+/// Take this lease's place in the queue again after it gave up its reservation while its job was down: the
+/// same test `run` applies at admission, without the settle wait (the card has been clear for a long
+/// stretch by now). None: admitted again. Some(why): not yet.
+fn readmit(root: &Path, me: &mut Lease, o: &RunOpts, card: &Card, view: &View) -> Result<Option<String>, String> {
+    let _l = lock(root)?;
+    let leases = prune(root, &view.by_lease);
+    if !leases.iter().any(|l| l.id == me.id) {
+        ledger::write(root, me)?; // removed by hand; put the request back
+    }
+    let outstanding = ledger::outstanding(&leases, &view.by_lease, unix_now());
+    let avail = ledger::available(card.total_mib, view.used_mib, outstanding, o.headroom_mib);
+    let admissible = if o.strict_fifo {
+        ledger::may_admit(me, &leases, avail)
+    } else {
+        ledger::may_admit_backfill(me, &leases, avail, card.total_mib.saturating_sub(o.headroom_mib))
+    };
+    if !admissible {
+        return Ok(Some(admit::then_waiting(o.vram_mib, avail, ledger::queue_position(me, &leases))));
+    }
+    me.state = State::Admitted;
+    me.admitted_at = Some(unix_now());
+    ledger::write(root, me)?;
+    Ok(None)
+}
+
 /// Wait for the job. Unsupervised, that is all. With `--restart`, `--guard-power` or `--enforce-vram` it also
 /// watches the card every few seconds, stops the job when asked to, and starts it again after a GPU reset
 /// or a power-guard stop. Returns the exit code of the last run.
@@ -545,12 +574,13 @@ fn supervise(
     scanner: &mut Scanner,
     plog: &mut PowerLog,
 ) -> Result<i32, String> {
-    use crate::guard::{Ended, Verdict, Watch, should_restart};
+    use crate::guard::{Backoff, ClearGate, Ended, Verdict, Watch, should_restart};
     let policy = &o.policy;
     if !policy.supervised() {
         return Ok(child.wait().map_err(|e| e.to_string())?.code().unwrap_or(1));
     }
     let mut restarts_left = policy.restarts;
+    let mut backoff = Backoff::default();
     loop {
         let started_at = unix_now();
         let mut watch = Watch::default();
@@ -589,6 +619,7 @@ fn supervise(
             plog.pause(POLL);
         };
         let ended = stopped.unwrap_or(Ended::Exit(code));
+        backoff.note_end(ended, unix_now() - started_at);
         // A GPU reset logged since the job started (a little before, for clock skew).
         let reset =
             crate::tdr::recent_resets((unix_now() - started_at) as u64 + 120).iter().any(|t| *t >= started_at - 5.0);
@@ -598,11 +629,15 @@ fn supervise(
             }
             return Ok(if stopped.is_some() { 3 } else { code });
         }
+        // After a power-guard stop the card must stay clear for a stretch that grows with each fruitless stop
+        // in a row; a GPU reset needs only the cool-down.
+        let need = backoff.clear_needed(policy, ended);
         restarts_left -= 1;
         eprintln!(
-            "vramorama: lease {}: job ended ({ended:?}{}); starting it again in {RESTART_COOLDOWN_SECS}s, {restarts_left} restart(s) left",
+            "vramorama: lease {}: job ended ({ended:?}{}); starting it again in {RESTART_COOLDOWN_SECS}s{}, {restarts_left} restart(s) left",
             me.id,
-            if reset { ", GPU reset logged" } else { "" }
+            if reset { ", GPU reset logged" } else { "" },
+            if need > 0.0 { format!(" and once nothing has blocked for {}", duration(need)) } else { String::new() }
         );
         // Keep the lease alive on this process while the job is down.
         me.job_pid = None;
@@ -614,23 +649,72 @@ fn supervise(
         std::thread::sleep(Duration::from_secs(RESTART_COOLDOWN_SECS));
         plog.after_pause();
         let waited = Instant::now();
+        let mut gate = ClearGate::default();
+        let mut notes = admit::NoteLog::default();
+        let mut released = false;
+        let mut hinted = false;
         loop {
             let view = observe(sampler, scanner, card);
-            plog.check(view.power.as_ref(), unix_now());
-            match view.power.as_ref().filter(|p| p.capped()) {
-                None => break,
-                Some(p) if waited.elapsed() > RESTART_MAX_CAPPED => {
-                    eprintln!(
-                        "vramorama: lease {}: still power-capped ({:.0} W) after {}; giving up",
-                        me.id,
-                        p.enforced_w,
-                        duration(waited.elapsed().as_secs_f64())
-                    );
-                    return Ok(3);
+            let now = unix_now();
+            plog.check(view.power.as_ref(), now);
+            // The same health conditions that stop a new lease from being admitted: a power cap, memory
+            // spilled into RAM, and a commit charge near its limit. A restart that lands in any of them
+            // spends a restart and loads the whole job onto a scarce card and scarce RAM for nothing.
+            let blockers = admit::blockers(&view.spills, None, view.power.as_ref(), view.commit, o.max_commit_pct);
+            let note = if gate.open(now, !blockers.is_empty(), need) {
+                if !released {
+                    break;
                 }
-                // Checked again in 30 s, or at once when Windows reports a power change.
-                Some(_) => plog.pause(Duration::from_secs(30)),
+                // The reservation was given up while waiting: take a place in the queue like anyone else.
+                match readmit(root, me, o, card, &view)? {
+                    None => break,
+                    Some(why) => Some(format!("the card is clear, but {why}")),
+                }
+            } else if blockers.is_empty() {
+                Some(format!("the card is clear; waiting for it to stay clear for {}", duration(need)))
+            } else {
+                admit::blocked_note(&blockers, None)
+                    .map(|n| format!("{n}; the job restarts once nothing has blocked for {}", duration(need)))
+            };
+            if let Some(n) = note.filter(|n| !o.quiet && notes.due(n, now)) {
+                eprintln!("vramorama: {} lease {} (job down): {n}", crate::sys::fmt_local_secs(now), me.id);
             }
+            if !hinted && !blockers.is_empty() && !o.quiet {
+                hinted = true;
+                for h in admit::routing_hints(&gpu::adapters(), card.luid) {
+                    eprintln!("vramorama: lease {} (job down): other devices: {h}", me.id);
+                }
+            }
+            if waited.elapsed() > RESTART_MAX_WAIT {
+                eprintln!(
+                    "vramorama: lease {}: the card did not stay clear for {} in {} (clear for {} at the end); giving up",
+                    me.id,
+                    duration(need),
+                    duration(waited.elapsed().as_secs_f64()),
+                    duration(gate.clear_for(now))
+                );
+                return Ok(3);
+            }
+            if !released && waited.elapsed() >= HOLD_RESERVATION {
+                // Do not hold the card idle through a long wait: give the reservation up and queue again.
+                released = true;
+                me.state = State::Waiting;
+                me.admitted_at = None;
+                {
+                    let _l = lock(root)?;
+                    ledger::write(root, me)?;
+                }
+                if !o.quiet {
+                    eprintln!(
+                        "vramorama: lease {}: gives up its {} MiB reservation while the job is down, so others can use the card; it queues again once the card has stayed clear for {}",
+                        me.id,
+                        thousands(me.vram_mib),
+                        duration(need)
+                    );
+                }
+            }
+            // Checked again in 30 s, or at once when Windows reports a power change.
+            plog.pause(Duration::from_secs(30));
         }
         child = job_command(o, tags).spawn().map_err(|e| format!("could not restart {}: {e}", o.argv[0]))?;
         me.job_pid = Some(child.id());

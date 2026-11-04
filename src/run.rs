@@ -51,6 +51,10 @@ pub struct RunOpts {
     pub awake: crate::sys::Awake,
     /// Opt-in supervision of the job this process starts (restart, power guard, VRAM enforcement).
     pub policy: crate::guard::Policy,
+    /// Work that must unload before this lease is considered (`--after`), and for how long it must stay
+    /// unloaded (`--after-quiet`).
+    pub after: Vec<crate::after::Target>,
+    pub after_quiet_secs: f64,
     pub argv: Vec<String>,
 }
 
@@ -107,6 +111,8 @@ struct View {
     power: Option<crate::power::PowerState>,
     /// System commit charge and its limit, in MiB.
     commit: Option<(u64, u64)>,
+    /// Every process holding memory on the card except the agents' own, for `--after`.
+    holders: Vec<crate::after::Holder>,
 }
 
 fn observe(sampler: &mut Sampler, scanner: &mut Scanner, card: &Card) -> View {
@@ -147,6 +153,11 @@ fn observe(sampler: &mut Sampler, scanner: &mut Scanner, card: &Card) -> View {
         },
         commit: procs::system_memory()
             .map(|m| (m.commit_limit.saturating_sub(m.commit_avail) / MIB, m.commit_limit / MIB)),
+        holders: rows
+            .iter()
+            .filter(|r| !r.agent_proc)
+            .map(|r| crate::after::Holder { pid: r.pid, mib: r.mib, owner: r.owner.clone(), cwd: r.cwd.clone() })
+            .collect(),
     }
 }
 
@@ -337,6 +348,9 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
         job_started: None,
         created: unix_now(),
         admitted_at: None,
+        after: o.after.iter().map(crate::after::Target::label).collect(),
+        // Deferred until the first check shows its --after work unloaded.
+        deferred: !o.after.is_empty(),
     };
     let mut sampler = Sampler::open()?;
     let mut scanner = Scanner::default();
@@ -356,8 +370,27 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
         eprintln!("vramorama: lease {}: no Windows power notifications here; the card is checked every 2 s", me.id);
     }
     let mut thrash = crate::thrash::Detector::new(60.0);
+    let mut after_gate = crate::after::AfterGate::default();
+    let mut after_reported = o.after.is_empty();
     loop {
         let view = observe(&mut sampler, &mut scanner, &card);
+        if !after_reported && !o.quiet {
+            // Once, so a typo in a target shows at the start of the log rather than as a silent no-op.
+            for t in &o.after {
+                let held: Vec<&crate::after::Holder> = view.holders.iter().filter(|h| t.matches(h)).collect();
+                let what = if held.is_empty() {
+                    "nothing on the card matches it now".to_string()
+                } else {
+                    format!(
+                        "{} MiB in pid {}",
+                        thousands(held.iter().map(|h| h.mib).sum()),
+                        held.iter().map(|h| h.pid.to_string()).collect::<Vec<_>>().join(", ")
+                    )
+                };
+                eprintln!("vramorama: lease {} --after {}: {what}", me.id, t.label());
+            }
+        }
+        after_reported = true;
         let read_at = unix_now();
         plog.check(view.power.as_ref(), read_at);
         thrash.push(
@@ -386,9 +419,28 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
             // and so is this request's own wait behind them.
             let blockers =
                 admit::blockers(&view.spills, thrashing.as_ref(), view.power.as_ref(), view.commit, o.max_commit_pct);
+            // --after work that has not unloaded (or not stayed unloaded long enough) holds this lease back
+            // before memory is even considered; the ledger marks it deferred so later requests can backfill.
+            let after_note = if o.after.is_empty() {
+                None
+            } else {
+                let open: Vec<String> = leases.iter().filter(|l| l.id != me.id).map(|l| l.id.clone()).collect();
+                let loaded = crate::after::loaded(&o.after, &view.holders, &open);
+                crate::after::note(&after_gate.update(loaded, read_at, o.after_quiet_secs), o.after_quiet_secs)
+            };
+            if me.deferred != after_note.is_some() {
+                me.deferred = after_note.is_some();
+                ledger::write(&root, &me)?;
+            }
             let then =
                 (!admissible).then(|| admit::then_waiting(o.vram_mib, avail, ledger::queue_position(&me, &leases)));
-            if let Some(note) = admit::blocked_note(&blockers, then.as_deref()) {
+            if let Some(after_note) = after_note {
+                fits_since = None;
+                Some(match admit::blocked_note(&blockers, None) {
+                    Some(b) => format!("{after_note}; also {b}"),
+                    None => after_note,
+                })
+            } else if let Some(note) = admit::blocked_note(&blockers, then.as_deref()) {
                 fits_since = None;
                 Some(note)
             } else if admissible {
@@ -935,6 +987,7 @@ pub fn leases(json_out: bool, adapter: Option<&str>, headroom_mib: u64) -> Resul
     );
     for l in &leases {
         let state = match l.state {
+            State::Waiting if l.deferred => "deferred",
             State::Waiting => "waiting",
             // Past the grace period an admitted lease is charged only for what it holds.
             State::Admitted if ledger::reservation_lapsed(l, now) => "holding",
@@ -955,6 +1008,14 @@ pub fn leases(json_out: bool, adapter: Option<&str>, headroom_mib: u64) -> Resul
             l.cmd
         );
         println!("{}", ellipsize(&line, width));
+    }
+    for l in leases.iter().filter(|l| !l.after.is_empty() && l.state == State::Waiting) {
+        println!(
+            "  lease {} {} --after {}",
+            l.id,
+            if l.deferred { "waits for this work to unload:" } else { "has seen this work unload:" },
+            l.after.join(", ")
+        );
     }
     Ok(())
 }

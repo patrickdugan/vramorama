@@ -37,6 +37,10 @@ pub struct Lease {
     /// Unix seconds.
     pub created: f64,
     pub admitted_at: Option<f64>,
+    /// `run --after` targets, as `after::Target::label` writes them.
+    pub after: Vec<String>,
+    /// Waiting only because an `--after` target has not unloaded yet (see `may_admit_backfill`).
+    pub deferred: bool,
 }
 
 impl Lease {
@@ -55,6 +59,8 @@ impl Lease {
             ("job_started", self.job_started.map(|t| t.to_string()).into()),
             ("created", self.created.into()),
             ("admitted_at", self.admitted_at.into()),
+            ("after", Value::Arr(self.after.iter().map(|t| t.as_str().into()).collect())),
+            ("deferred", self.deferred.into()),
         ])
     }
 
@@ -78,6 +84,16 @@ impl Lease {
             job_started: ft("job_started"),
             created: v.f64("created")?,
             admitted_at: v.f64("admitted_at"),
+            // Leases written before 0.13 have neither field.
+            after: v
+                .arr("after")
+                .iter()
+                .filter_map(|t| match t {
+                    Value::Str(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            deferred: matches!(v.get("deferred"), Some(Value::Bool(true))),
         })
     }
 }
@@ -151,7 +167,9 @@ pub fn may_admit(me: &Lease, leases: &[Lease], available: i64) -> bool {
 /// (backfill), so a request that is waiting for a 12 GiB gap does not idle a card that has 5 GiB free
 /// for hours. It may jump the queue only if it still fits and every earlier waiting request would
 /// still fit on the card once `me` is running: `capacity` is the card's total less headroom. Then `me`
-/// can delay an earlier request only for as long as `me` runs, never push it out of reach.
+/// can delay an earlier request only for as long as `me` runs, never push it out of reach. An earlier
+/// request that is `deferred` (still waiting for its `--after` work to unload) cannot start yet either,
+/// whatever the free memory says.
 pub fn may_admit_backfill(me: &Lease, leases: &[Lease], available: i64, capacity: u64) -> bool {
     if me.vram_mib as i64 > available {
         return false;
@@ -159,7 +177,7 @@ pub fn may_admit_backfill(me: &Lease, leases: &[Lease], available: i64, capacity
     leases
         .iter()
         .filter(|l| l.id != me.id && l.state == State::Waiting && earlier(l, me))
-        .all(|l| l.vram_mib as i64 > available && l.vram_mib + me.vram_mib <= capacity)
+        .all(|l| (l.deferred || l.vram_mib as i64 > available) && l.vram_mib + me.vram_mib <= capacity)
 }
 
 /// The earlier waiting requests `me` would go ahead of by backfilling (empty when it is first in line).
@@ -271,6 +289,8 @@ mod tests {
             job_started: None,
             created,
             admitted_at: None,
+            after: Vec::new(),
+            deferred: false,
         }
     }
 
@@ -291,6 +311,8 @@ mod tests {
         l.job_pid = Some(4242);
         l.job_started = Some(134_045_000_000_000_123);
         l.admitted_at = Some(1_791_432_530.0);
+        l.after = vec!["session:claude:2b87abc0".into(), "pid:77".into()];
+        l.deferred = true;
         let back = Lease::from_json(&json::parse(&l.to_json().to_string()).unwrap()).unwrap();
         assert_eq!(back, l);
     }
@@ -368,6 +390,29 @@ mod tests {
         assert!(!may_admit_backfill(&small, &[fits, small.clone()], 4854, capacity));
         // The head of the queue is admitted as usual.
         assert!(may_admit_backfill(&big, &all, 12288, capacity));
+    }
+
+    #[test]
+    fn a_deferred_request_can_be_backfilled_but_never_pushed_out_of_reach() {
+        // 2026-11-04: an 11 GiB lease waited for another session's two llama-servers to unload.
+        let capacity = 15915 - 512;
+        let mut after = lease("after", State::Waiting, 11264, 1.0);
+        after.deferred = true;
+        let small = lease("small", State::Waiting, 3072, 2.0);
+        let big = lease("big", State::Waiting, 8192, 3.0);
+        // The card is free, but `after` waits on its target: a small job may use the time.
+        assert!(may_admit_backfill(&small, &[after.clone(), small.clone()], 15000, capacity));
+        // One that would leave `after` unable to fit on an otherwise empty card may not.
+        assert!(!may_admit_backfill(&big, &[after.clone(), big.clone()], 15000, capacity));
+        // Strict first come, first served still waits behind it.
+        assert!(!may_admit(&small, &[after.clone(), small.clone()], 15000));
+        // Once its targets have unloaded it is an ordinary waiting request again, served first.
+        after.deferred = false;
+        assert!(!may_admit_backfill(&small, &[after.clone(), small.clone()], 15000, capacity));
+        // Old ledger files without the fields read as not deferred.
+        let old = json::parse(r#"{"id":"x","state":"waiting","vram_mib":1,"runner_pid":1,"created":1}"#).unwrap();
+        let l = Lease::from_json(&old).unwrap();
+        assert!(!l.deferred && l.after.is_empty());
     }
 
     #[test]

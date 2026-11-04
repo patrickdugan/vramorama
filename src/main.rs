@@ -4,6 +4,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 mod admit;
+mod after;
 mod crash;
 mod doctor;
 mod guard;
@@ -79,7 +80,8 @@ USAGE
   vramorama run --vram SIZE [--owner NAME] [--detach [--out FILE]] [--wait SECS]
                 [--settle SECS] [--headroom MIB] [--adapter NAME] [--strict-fifo] [--quiet]
                 [--restart N] [--guard-power SECS] [--enforce-vram SLACK_MIB]
-                [--max-commit PCT] [--allow-display-off] [--no-keep-awake] -- COMMAND...
+                [--max-commit PCT] [--allow-display-off] [--no-keep-awake]
+                [--after TARGET]... [--after-quiet SECS] -- COMMAND...
       Wait until SIZE (e.g. 9G, 6000M) fits on the card, first come first served, then
       run COMMAND tagged VRAMORAMA_LEASE=<id> and keep the reservation until it and its
       children exit. A small request may go ahead of a larger one that cannot start yet, if
@@ -94,6 +96,13 @@ USAGE
       no setting and ends with the job. --allow-display-off lets the screen switch off,
       --no-keep-awake asks for nothing. --detach starts it outside this session (output to --out)
       and then cannot hold the machine awake.
+      --after TARGET (repeatable) queues behind work that was not started through `run`: the
+      lease is not considered until TARGET holds under 256 MiB on the card and has stayed so for
+      --after-quiet SECS (default 120), so a job that unloads one model and loads the next is
+      not cut into. TARGET is a pid, pid:N, session:ID (an agent session, e.g. claude:2b87abc0),
+      owner:LABEL, cwd:FOLDER (the [name] `ps` shows) or lease:ID (until that lease ends).
+      While it waits the lease is `deferred`: later requests may backfill only if they leave
+      room for it on an otherwise empty card.
       Supervised runs (opt-in, the job stays attached to this process; they only ever stop a job
       that `run` itself started):
         --restart N          start the job again, up to N times, after a Windows GPU reset (a TDR
@@ -360,6 +369,8 @@ fn os_run(args: &[String]) -> Result<i32, String> {
         max_commit_pct: doctor::DEFAULT_MAX_COMMIT_PCT,
         awake: sys::Awake::SystemAndDisplay,
         policy: guard::Policy::default(),
+        after: Vec::new(),
+        after_quiet_secs: after::DEFAULT_QUIET_SECS,
         argv,
     };
     let mut it = flags.iter();
@@ -386,6 +397,8 @@ fn os_run(args: &[String]) -> Result<i32, String> {
                     .filter(|p| *p <= 100)
                     .ok_or("--max-commit takes a percentage from 0 to 100")?
             }
+            "--after" => o.after.push(after::Target::parse(&value("--after")?)?),
+            "--after-quiet" => o.after_quiet_secs = secs(value("--after-quiet")?, "--after-quiet")?,
             "--allow-display-off" => o.awake = sys::Awake::System,
             "--no-keep-awake" => o.awake = sys::Awake::Off,
             "--restart" => o.policy.restarts = value("--restart")?.parse().map_err(|_| "--restart takes a count")?,

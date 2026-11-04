@@ -314,6 +314,22 @@ lease 234228b0 pid 42620 (started through WMI, outside this session)
   while the system commit charge is at or above `--max-commit` percent of its limit (default 92).
   When several of these hold at once, the waiting line names all of them, and whether the request
   would still have to wait for memory or its turn once they clear.
+- **Waiting for work outside the queue: `--after`.** Memory that a job started without `run` holds is
+  respected, but that job is not in the queue, so the memory test alone admits the next lease in the
+  moment between it unloading one model and loading the next. `--after TARGET` names the work to wait
+  for: a pid, `session:ID` (an agent session, as `sessions` shows it, e.g. `claude:2b87abc0`),
+  `owner:LABEL`, `cwd:FOLDER` (the `[name]` `ps` shows) or `lease:ID` (until that lease ends). It
+  can be repeated. The lease is not considered until every target holds under 256 MiB on the card
+  and has stayed that way for `--after-quiet` seconds (default 120; a target that loads again starts
+  the window over), and is then admitted by the usual tests. While it waits, `leases` shows it as
+  `deferred` with its targets; later requests may backfill past it only if they leave room for it on
+  an otherwise empty card, so the work it waits for finishing never finds it pushed out of reach.
+
+  ```text
+  > vramorama run --vram 11G --after session:claude:2b87abc0 --guard-power 120 -- python job.py
+  vramorama: lease d1c8d03e --after session:claude:2b87abc0: 14,298 MiB in pid 27276, 30196
+  vramorama: lease d1c8d03e waits for 11,264 MiB on NVIDIA GeForce RTX 5080 Laptop GPU (as of 11:36:04): waiting for --after work to unload: session:claude:2b87abc0 holds 14,298 MiB in pid 27276, 30196
+  ```
 - **Every check is a fresh reading.** A waiting lease reads the card every 2 s, and at once when
   Windows reports a power change: AC or battery, the power plan, the power mode, battery or energy
   saver, the lid, the display going off or on, sleep and resume (see [Power cap](#power-cap)). Each
@@ -664,7 +680,7 @@ workflow uses no third-party actions (it checks out with plain `git`).
   the same machine. A Linux backend (NVML) is
   planned.
 - `run` schedules only the jobs started through it, and nothing in vramorama stops or kills a
-  process except, when asked with `--guard-power` or `--enforce-vram`, the job `run` itself started. Other GPU users are respected (their memory counts as in use) but not queued. The settle
+  process except, when asked with `--guard-power` or `--enforce-vram`, the job `run` itself started. Other GPU users are respected (their memory counts as in use) but not queued; a lease can wait for named ones to unload with `--after`, but they never wait for a lease. The settle
   growth check protects new leases from a job that is still loading, but a job started outside
   `run` can still start on memory a lease has reserved and push the card into spill.
 - The power-cap rule is a threshold on the enforced limit (at most half the default). It reads NVIDIA

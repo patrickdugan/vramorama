@@ -390,6 +390,12 @@ vramorama run --vram 11G --restart 5 --guard-power 30 --enforce-vram 512 -- pyth
 - `--guard-power SECS` stops the job (and its process tree) after the card has been power-capped for SECS
   seconds. A capped card would run it twenty times slower and the next long kernel would reset the GPU
   for everyone. With `--restart` it starts again once the card has stayed clear (see `--restart`).
+- `--pause-exit CODE` lets the job stop itself. A job that checks the cap between steps (for example
+  `nvidia-smi --query-gpu=enforced.power.limit`), saves its checkpoint and exits with CODE is restarted
+  exactly like a power-guard stop: same cool-down, same clear stretch and backoff, same restart budget. A
+  kill lands wherever the job is; on 2026-11-04 Windows logged a GPU reset one second after the power
+  guard stopped a 3B-model capture mid-kernel. Keep `--guard-power` as the backstop for a job that hangs.
+  CODE cannot be 0 or 3.
 - `--enforce-vram MIB` stops the job when its processes hold more than the lease plus MIB. Without it a
   job that allocates more than it asked for is not touched.
 

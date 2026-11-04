@@ -12,13 +12,28 @@ pub struct Policy {
     pub guard_power_secs: Option<f64>,
     /// Stop the job when it holds more than its lease plus this many MiB.
     pub enforce_vram_slack_mib: Option<u64>,
-    /// Restarts allowed after a GPU reset or a power-guard stop.
+    /// Restarts allowed after a GPU reset, a power-guard stop or a pause.
     pub restarts: u32,
+    /// An exit with this code means the job stopped itself at a checkpoint because the card was blocked
+    /// (`--pause-exit`): it is restarted like a power-guard stop, without being killed mid-kernel.
+    pub pause_exit: Option<i32>,
 }
 
 impl Policy {
     pub fn supervised(&self) -> bool {
-        self.guard_power_secs.is_some() || self.enforce_vram_slack_mib.is_some() || self.restarts > 0
+        self.guard_power_secs.is_some()
+            || self.enforce_vram_slack_mib.is_some()
+            || self.restarts > 0
+            || self.pause_exit.is_some()
+    }
+}
+
+/// How a job that exited on its own with `code` ended, under policy `p`.
+pub fn classify_exit(p: &Policy, code: i32) -> Ended {
+    if p.pause_exit == Some(code) {
+        Ended::Paused
+    } else {
+        Ended::Exit(code)
     }
 }
 
@@ -36,6 +51,8 @@ pub enum Ended {
     Exit(i32),
     /// Stopped by the power guard.
     PowerGuard,
+    /// Exited with the `--pause-exit` code: it saw the card blocked and stopped itself at a checkpoint.
+    Paused,
     /// Stopped for exceeding its lease.
     VramGuard,
 }
@@ -80,7 +97,7 @@ pub fn should_restart(ended: Ended, gpu_reset: bool, restarts_left: u32) -> bool
     match ended {
         Ended::Exit(0) => false,
         Ended::Exit(_) => gpu_reset,
-        Ended::PowerGuard => true,
+        Ended::PowerGuard | Ended::Paused => true,
         Ended::VramGuard => false,
     }
 }
@@ -107,16 +124,16 @@ impl Backoff {
     /// Record why the job ended and how long it had run.
     pub fn note_end(&mut self, ended: Ended, ran_secs: f64) {
         match ended {
-            Ended::PowerGuard if ran_secs < FAIR_RUN_SECS => self.streak += 1,
+            Ended::PowerGuard | Ended::Paused if ran_secs < FAIR_RUN_SECS => self.streak += 1,
             _ => self.streak = 0,
         }
     }
 
-    /// How long the card must stay clear before the next start. A stop by the power guard waits for one and
-    /// a half guard windows (at least a minute), doubled for each earlier fruitless stop in a row; other
-    /// endings (a GPU reset) need no clear stretch beyond the cool-down.
+    /// How long the card must stay clear before the next start. A stop by the power guard or a pause waits
+    /// for one and a half guard windows (at least a minute), doubled for each earlier fruitless stop in a
+    /// row; other endings (a GPU reset) need no clear stretch beyond the cool-down.
     pub fn clear_needed(&self, p: &Policy, ended: Ended) -> f64 {
-        if ended != Ended::PowerGuard {
+        if !matches!(ended, Ended::PowerGuard | Ended::Paused) {
             return 0.0;
         }
         let base = (p.guard_power_secs.unwrap_or(60.0) * 1.5).max(60.0);
@@ -153,7 +170,27 @@ mod tests {
     use super::*;
 
     fn pol() -> Policy {
-        Policy { guard_power_secs: Some(10.0), enforce_vram_slack_mib: Some(512), restarts: 3 }
+        Policy { guard_power_secs: Some(10.0), enforce_vram_slack_mib: Some(512), restarts: 3, pause_exit: None }
+    }
+
+    #[test]
+    fn a_pause_exit_restarts_and_backs_off_like_a_power_stop() {
+        // 2026-11-04: the LOTUS capture was killed mid-kernel by the power guard and Windows logged a GPU
+        // reset a second later; a job that checks the cap itself between cases exits cleanly instead.
+        let p = Policy { guard_power_secs: Some(90.0), restarts: 2, pause_exit: Some(75), ..Policy::default() };
+        assert!(p.supervised());
+        assert!(Policy { pause_exit: Some(75), ..Policy::default() }.supervised());
+        assert_eq!(classify_exit(&p, 75), Ended::Paused);
+        assert_eq!(classify_exit(&p, 2), Ended::Exit(2));
+        assert_eq!(classify_exit(&pol(), 75), Ended::Exit(75), "without --pause-exit 75 is an ordinary failure");
+        assert!(should_restart(Ended::Paused, false, 1));
+        assert!(!should_restart(Ended::Paused, false, 0));
+        assert!(!should_restart(classify_exit(&pol(), 75), false, 3));
+        let mut b = Backoff::default();
+        assert_eq!(b.clear_needed(&p, Ended::Paused), 135.0);
+        b.note_end(Ended::Paused, 400.0);
+        b.note_end(Ended::PowerGuard, 300.0);
+        assert_eq!(b.clear_needed(&p, Ended::Paused), 270.0, "pauses and guard stops count as one streak");
     }
 
     #[test]
@@ -201,7 +238,7 @@ mod tests {
     #[test]
     fn each_fruitless_power_stop_in_a_row_doubles_the_clear_stretch() {
         // 2026-10-25: --guard-power 120, the job stopped every ~2 minutes because the cap kept coming back.
-        let p = Policy { guard_power_secs: Some(120.0), enforce_vram_slack_mib: None, restarts: 5 };
+        let p = Policy { guard_power_secs: Some(120.0), enforce_vram_slack_mib: None, restarts: 5, pause_exit: None };
         let mut b = Backoff::default();
         assert_eq!(
             b.clear_needed(&p, Ended::PowerGuard),
@@ -224,7 +261,7 @@ mod tests {
 
     #[test]
     fn a_long_run_or_another_ending_starts_the_count_over() {
-        let p = Policy { guard_power_secs: Some(120.0), enforce_vram_slack_mib: None, restarts: 5 };
+        let p = Policy { guard_power_secs: Some(120.0), enforce_vram_slack_mib: None, restarts: 5, pause_exit: None };
         let mut b = Backoff::default();
         b.note_end(Ended::PowerGuard, 100.0);
         b.note_end(Ended::PowerGuard, 100.0);
@@ -239,12 +276,12 @@ mod tests {
 
     #[test]
     fn a_gpu_reset_needs_no_clear_stretch_and_a_tiny_guard_window_still_waits_a_minute() {
-        let p = Policy { guard_power_secs: Some(10.0), enforce_vram_slack_mib: None, restarts: 3 };
+        let p = Policy { guard_power_secs: Some(10.0), enforce_vram_slack_mib: None, restarts: 3, pause_exit: None };
         let mut b = Backoff::default();
         assert_eq!(b.clear_needed(&p, Ended::Exit(-1073740791)), 0.0);
         assert_eq!(b.clear_needed(&p, Ended::PowerGuard), 60.0);
         // No guard window at all (--restart alone, then only a reset can end it): the floor still applies.
-        let none = Policy { guard_power_secs: None, enforce_vram_slack_mib: None, restarts: 3 };
+        let none = Policy { guard_power_secs: None, enforce_vram_slack_mib: None, restarts: 3, pause_exit: None };
         assert_eq!(b.clear_needed(&none, Ended::PowerGuard), 90.0);
         b.note_end(Ended::PowerGuard, 5.0);
         assert_eq!(b.clear_needed(&none, Ended::PowerGuard), 90.0);

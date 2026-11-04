@@ -80,7 +80,7 @@ USAGE
       Find the agent transcript whose session launched PID (for untagged processes).
   vramorama run --vram SIZE [--owner NAME] [--detach [--out FILE]] [--wait SECS]
                 [--settle SECS] [--headroom MIB] [--adapter NAME] [--strict-fifo] [--quiet]
-                [--restart N] [--guard-power SECS] [--enforce-vram SLACK_MIB]
+                [--restart N] [--guard-power SECS] [--pause-exit CODE] [--enforce-vram SLACK_MIB]
                 [--max-commit PCT] [--allow-display-off] [--no-keep-awake]
                 [--after TARGET]... [--after-quiet SECS] -- COMMAND...
       Wait until SIZE (e.g. 9G, 6000M) fits on the card, first come first served, then
@@ -114,6 +114,9 @@ USAGE
                              fruitless stop in a row (30 min at most); it gives its reservation up
                              after 5 min of waiting and queues again.
         --guard-power SECS   stop the job if the card stays power-capped for SECS seconds.
+        --pause-exit CODE    the job exits with CODE when it sees the card blocked and has
+                             saved its checkpoint (between steps, not mid-kernel); it is
+                             restarted like a --guard-power stop, with the same wait.
         --enforce-vram MIB   stop the job if it holds more than its lease plus MIB.
   vramorama power [--json] [--adapter NAME]
       Board power, the enforced power limit and the driver's default limit. A laptop GPU held
@@ -404,6 +407,13 @@ fn os_run(args: &[String]) -> Result<i32, String> {
             "--no-keep-awake" => o.awake = sys::Awake::Off,
             "--restart" => o.policy.restarts = value("--restart")?.parse().map_err(|_| "--restart takes a count")?,
             "--guard-power" => o.policy.guard_power_secs = Some(secs(value("--guard-power")?, "--guard-power")?),
+            "--pause-exit" => {
+                let code: i32 = value("--pause-exit")?.parse().map_err(|_| "--pause-exit takes an exit code")?;
+                if code == 0 || code == 3 {
+                    return Err("--pause-exit cannot be 0 (success) or 3 (a guard stop)".into());
+                }
+                o.policy.pause_exit = Some(code);
+            }
             "--enforce-vram" => {
                 o.policy.enforce_vram_slack_mib =
                     Some(value("--enforce-vram")?.parse().map_err(|_| "--enforce-vram takes MiB of slack")?)

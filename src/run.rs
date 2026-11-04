@@ -670,7 +670,10 @@ fn supervise(
             }
             plog.pause(POLL);
         };
-        let ended = stopped.unwrap_or(Ended::Exit(code));
+        let ended = stopped.unwrap_or_else(|| crate::guard::classify_exit(policy, code));
+        if ended == Ended::Paused && !o.quiet {
+            eprintln!("vramorama: lease {}: the job paused itself (exit {code}, --pause-exit)", me.id);
+        }
         backoff.note_end(ended, unix_now() - started_at);
         // A GPU reset logged since the job started (a little before, for clock skew).
         let reset =

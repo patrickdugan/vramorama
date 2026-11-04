@@ -30,11 +30,7 @@ impl Policy {
 
 /// How a job that exited on its own with `code` ended, under policy `p`.
 pub fn classify_exit(p: &Policy, code: i32) -> Ended {
-    if p.pause_exit == Some(code) {
-        Ended::Paused
-    } else {
-        Ended::Exit(code)
-    }
+    if p.pause_exit == Some(code) { Ended::Paused } else { Ended::Exit(code) }
 }
 
 #[derive(Clone, Debug, PartialEq)]

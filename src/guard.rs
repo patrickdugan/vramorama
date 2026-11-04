@@ -101,6 +101,12 @@ pub fn should_restart(ended: Ended, gpu_reset: bool, restarts_left: u32) -> bool
 /// A power-guard stop sooner than this after the job started was not a fair try (the cap was most likely
 /// still on); a job that ran longer made progress, so its next stop starts the count over.
 pub const FAIR_RUN_SECS: f64 = 900.0;
+/// A `--pause-exit` sooner than this after the job started was not a fair try. A pause after longer made
+/// progress (the job saves its checkpoint before it stops itself), so its next pause starts the count over.
+/// 2026-11-04: the card reached its 15 W cap after about five minutes of full load every time, so a
+/// checkpointing job paused every five to six minutes; counting those pauses as fruitless would have
+/// doubled the wait to half an hour within four windows.
+pub const PAUSE_FAIR_RUN_SECS: f64 = 180.0;
 /// The longest the card is ever required to stay clear before a stopped job is started again.
 pub const MAX_CLEAR_SECS: f64 = 1800.0;
 
@@ -120,7 +126,8 @@ impl Backoff {
     /// Record why the job ended and how long it had run.
     pub fn note_end(&mut self, ended: Ended, ran_secs: f64) {
         match ended {
-            Ended::PowerGuard | Ended::Paused if ran_secs < FAIR_RUN_SECS => self.streak += 1,
+            Ended::PowerGuard if ran_secs < FAIR_RUN_SECS => self.streak += 1,
+            Ended::Paused if ran_secs < PAUSE_FAIR_RUN_SECS => self.streak += 1,
             _ => self.streak = 0,
         }
     }
@@ -184,9 +191,29 @@ mod tests {
         assert!(!should_restart(classify_exit(&pol(), 75), false, 3));
         let mut b = Backoff::default();
         assert_eq!(b.clear_needed(&p, Ended::Paused), 135.0);
-        b.note_end(Ended::Paused, 400.0);
+        b.note_end(Ended::Paused, 60.0);
         b.note_end(Ended::PowerGuard, 300.0);
-        assert_eq!(b.clear_needed(&p, Ended::Paused), 270.0, "pauses and guard stops count as one streak");
+        assert_eq!(b.clear_needed(&p, Ended::Paused), 270.0, "short pauses and guard stops count as one streak");
+    }
+
+    #[test]
+    fn a_pause_after_a_productive_window_starts_the_count_over() {
+        // 2026-11-04: the cap came back after five to six minutes of full load, every time.
+        let p = Policy { guard_power_secs: Some(90.0), restarts: 20, pause_exit: Some(75), ..Policy::default() };
+        let mut b = Backoff::default();
+        for _ in 0..10 {
+            b.note_end(Ended::Paused, 330.0);
+            assert_eq!(b.clear_needed(&p, Ended::Paused), 135.0);
+        }
+        // A pause right after the start means the cap never really cleared: back off as before.
+        b.note_end(Ended::Paused, 40.0);
+        b.note_end(Ended::Paused, 40.0);
+        assert_eq!(b.clear_needed(&p, Ended::Paused), 270.0);
+        // The power guard keeps its own, longer fairness window.
+        let mut g = Backoff::default();
+        g.note_end(Ended::PowerGuard, 330.0);
+        g.note_end(Ended::PowerGuard, 330.0);
+        assert_eq!(g.clear_needed(&p, Ended::PowerGuard), 270.0);
     }
 
     #[test]

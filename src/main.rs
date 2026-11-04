@@ -116,7 +116,8 @@ USAGE
         --guard-power SECS   stop the job if the card stays power-capped for SECS seconds.
         --pause-exit CODE    the job exits with CODE when it sees the card blocked and has
                              saved its checkpoint (between steps, not mid-kernel); it is
-                             restarted like a --guard-power stop, with the same wait.
+                             restarted like a --guard-power stop; only a pause within
+                             3 min of the start lengthens the next wait.
         --enforce-vram MIB   stop the job if it holds more than its lease plus MIB.
   vramorama power [--json] [--adapter NAME]
       Board power, the enforced power limit and the driver's default limit. A laptop GPU held

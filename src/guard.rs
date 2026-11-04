@@ -203,7 +203,11 @@ mod tests {
         // 2026-10-25: --guard-power 120, the job stopped every ~2 minutes because the cap kept coming back.
         let p = Policy { guard_power_secs: Some(120.0), enforce_vram_slack_mib: None, restarts: 5 };
         let mut b = Backoff::default();
-        assert_eq!(b.clear_needed(&p, Ended::PowerGuard), 180.0, "even the first stop waits longer than the guard window");
+        assert_eq!(
+            b.clear_needed(&p, Ended::PowerGuard),
+            180.0,
+            "even the first stop waits longer than the guard window"
+        );
         b.note_end(Ended::PowerGuard, 125.0);
         assert_eq!(b.clear_needed(&p, Ended::PowerGuard), 180.0);
         b.note_end(Ended::PowerGuard, 130.0);

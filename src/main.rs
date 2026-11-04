@@ -3,6 +3,7 @@
 // Off Windows only `report` exists, so most of the shared code is unused there.
 #![cfg_attr(not(windows), allow(dead_code))]
 
+#[cfg(windows)]
 mod admit;
 mod after;
 mod crash;

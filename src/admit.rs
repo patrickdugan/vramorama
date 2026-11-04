@@ -244,7 +244,11 @@ clears; even then 6,144 MiB does not fit yet"
         ];
         let h = routing_hints(&all, 1);
         assert_eq!(h.len(), 2, "the card itself and the software adapter are not offered: {h:?}");
-        assert!(h[0].starts_with("AMD Radeon(TM) 880M Graphics is an integrated GPU that borrows system memory"), "{}", h[0]);
+        assert!(
+            h[0].starts_with("AMD Radeon(TM) 880M Graphics is an integrated GPU that borrows system memory"),
+            "{}",
+            h[0]
+        );
         assert!(h[0].contains("adds to the RAM and commit pressure"), "{}", h[0]);
         assert!(h[1].starts_with("an NPU, if the machine has one, only runs models compiled for it"), "{}", h[1]);
     }
@@ -253,7 +257,10 @@ clears; even then 6,144 MiB does not fit yet"
     fn a_second_discrete_card_is_offered_with_the_adapter_flag() {
         let all = [adapter(1, "NVIDIA A", 16_000, false), adapter(2, "NVIDIA B", 24_576, false)];
         let h = routing_hints(&all, 1);
-        assert_eq!(h[0], "NVIDIA B has 24 GiB of its own: start the job with --adapter \"NVIDIA B\" if its code can run there");
+        assert_eq!(
+            h[0],
+            "NVIDIA B has 24 GiB of its own: start the job with --adapter \"NVIDIA B\" if its code can run there"
+        );
         // Alone on the machine: only the general caveat is left.
         assert_eq!(routing_hints(&all[..1], 1).len(), 1);
     }

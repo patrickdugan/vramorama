@@ -11,6 +11,7 @@ mod doctor;
 mod guard;
 mod hook;
 mod idle;
+mod jobtree;
 mod json;
 mod ledger;
 mod owner;
@@ -81,7 +82,7 @@ USAGE
   vramorama run --vram SIZE [--owner NAME] [--detach [--out FILE]] [--wait SECS]
                 [--settle SECS] [--headroom MIB] [--adapter NAME] [--strict-fifo] [--quiet]
                 [--restart N] [--guard-power SECS] [--pause-exit CODE] [--enforce-vram SLACK_MIB]
-                [--max-commit PCT] [--allow-display-off] [--no-keep-awake]
+                [--max-commit PCT] [--allow-display-off] [--no-keep-awake] [--keep-tree]
                 [--after TARGET]... [--after-quiet SECS] -- COMMAND...
       Wait until SIZE (e.g. 9G, 6000M) fits on the card, first come first served, then
       run COMMAND tagged VRAMORAMA_LEASE=<id> and keep the reservation until it and its
@@ -97,6 +98,9 @@ USAGE
       no setting and ends with the job. --allow-display-off lets the screen switch off,
       --no-keep-awake asks for nothing. --detach starts it outside this session (output to --out)
       and then cannot hold the machine awake.
+      The job runs in a Job Object: if vramorama dies the job dies with it, and when the job's main
+      process exits, processes it left behind are listed and terminated so their RAM comes back.
+      --keep-tree skips this for a job that leaves a daemon running on purpose. (--detach: no job object.)
       --after TARGET (repeatable) queues behind work that was not started through `run`: the
       lease is not considered until TARGET holds under 256 MiB on the card and has stayed so for
       --after-quiet SECS (default 120), so a job that unloads one model and loads the next is
@@ -373,6 +377,7 @@ fn os_run(args: &[String]) -> Result<i32, String> {
         strict_fifo: false,
         max_commit_pct: doctor::DEFAULT_MAX_COMMIT_PCT,
         awake: sys::Awake::SystemAndDisplay,
+        keep_tree: false,
         policy: guard::Policy::default(),
         after: Vec::new(),
         after_quiet_secs: after::DEFAULT_QUIET_SECS,
@@ -406,6 +411,7 @@ fn os_run(args: &[String]) -> Result<i32, String> {
             "--after-quiet" => o.after_quiet_secs = secs(value("--after-quiet")?, "--after-quiet")?,
             "--allow-display-off" => o.awake = sys::Awake::System,
             "--no-keep-awake" => o.awake = sys::Awake::Off,
+            "--keep-tree" => o.keep_tree = true,
             "--restart" => o.policy.restarts = value("--restart")?.parse().map_err(|_| "--restart takes a count")?,
             "--guard-power" => o.policy.guard_power_secs = Some(secs(value("--guard-power")?, "--guard-power")?),
             "--pause-exit" => {

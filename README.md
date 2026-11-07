@@ -655,6 +655,29 @@ nothing holds the machine awake for it.
 of its limit (default 92, `0` turns it off): a job that grows from there pushes the machine into swap, and
 an allocation that fails inside a driver is a blue screen rather than an error message.
 
+### Cleaning up after a job
+
+`vramorama run` puts the job it starts (and every restart of it) in a Windows Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and holds the only handle. Two things follow:
+
+- If vramorama is killed or crashes, Windows ends the job and everything it started. A job no longer
+  survives its supervisor as an orphan holding VRAM spilled into RAM.
+- When the job's main process exits (any exit code, and before a `--restart`), `run` lists the processes
+  still in the job and terminates them, so multiprocessing workers, REPL subprocesses and launcher children
+  give their RAM back before the next start or before `run` returns:
+
+```
+vramorama: job exited; released 3 leftover processes (2,140 MiB): lgym.exe 4412, python.exe 5120, python.exe 5388
+```
+
+Nothing left prints nothing. `--quiet` hides the line. A process the job created before `run` assigned it to
+the job object (the first milliseconds) is not in the job. If the assignment fails, `run` prints one
+`vramorama:` warning and carries on without cleanup.
+
+`--keep-tree` skips the job object for a job that leaves a daemon running on purpose; its leftovers stay
+alive and it no longer dies with vramorama. A `--detach`ed job is outside the job object too, since it is
+meant to outlive `run`.
+
 ## How it works
 
 - **Memory and utilisation:** the `GPU Process Memory(*)\Dedicated Usage`, `GPU Engine(*)\Utilization

@@ -49,6 +49,8 @@ pub struct RunOpts {
     pub max_commit_pct: u32,
     /// What the running job asks of the power manager (see `sys::KeepAwake`).
     pub awake: crate::sys::Awake,
+    /// Leave processes the job left behind running, and do not tie the job's lifetime to this process.
+    pub keep_tree: bool,
     /// Opt-in supervision of the job this process starts (restart, power guard, VRAM enforcement).
     pub policy: crate::guard::Policy,
     /// Work that must unload before this lease is considered (`--after`), and for how long it must stay
@@ -567,12 +569,18 @@ pub fn run(o: &RunOpts) -> Result<i32, String> {
             Ok(0)
         }
         Started::Attached(child) => {
-            let code = supervise(&root, &mut me, o, &card, &tags, child, &mut sampler, &mut scanner, &mut plog)?;
+            let tree = tree_for(&child, o);
+            let code = supervise(&root, &mut me, o, &card, &tags, child, tree, &mut sampler, &mut scanner, &mut plog)?;
             let _l = lock(&root)?;
             ledger::remove(&root, &me.id);
             Ok(code)
         }
     }
+}
+
+/// A kill-on-close Job Object around an attached job, unless `--keep-tree` asks for none.
+fn tree_for(child: &Child, o: &RunOpts) -> Option<crate::jobtree::JobTree> {
+    if o.keep_tree { None } else { crate::jobtree::JobTree::attach(child) }
 }
 
 fn job_command(o: &RunOpts, tags: &[(&str, String)]) -> Command {
@@ -622,6 +630,7 @@ fn supervise(
     card: &Card,
     tags: &[(&str, String)],
     mut child: Child,
+    mut tree: Option<crate::jobtree::JobTree>,
     sampler: &mut Sampler,
     scanner: &mut Scanner,
     plog: &mut PowerLog,
@@ -629,7 +638,11 @@ fn supervise(
     use crate::guard::{Backoff, ClearGate, Ended, Verdict, Watch, should_restart};
     let policy = &o.policy;
     if !policy.supervised() {
-        return Ok(child.wait().map_err(|e| e.to_string())?.code().unwrap_or(1));
+        let code = child.wait().map_err(|e| e.to_string())?.code().unwrap_or(1);
+        if let Some(t) = tree.take() {
+            t.release(o.quiet);
+        }
+        return Ok(code);
     }
     let mut restarts_left = policy.restarts;
     let mut backoff = Backoff::default();
@@ -670,6 +683,9 @@ fn supervise(
             }
             plog.pause(POLL);
         };
+        if let Some(t) = tree.take() {
+            t.release(o.quiet);
+        }
         let ended = stopped.unwrap_or_else(|| crate::guard::classify_exit(policy, code));
         if ended == Ended::Paused && !o.quiet {
             eprintln!("vramorama: lease {}: the job paused itself (exit {code}, --pause-exit)", me.id);
@@ -772,6 +788,7 @@ fn supervise(
             plog.pause(Duration::from_secs(30));
         }
         child = job_command(o, tags).spawn().map_err(|e| format!("could not restart {}: {e}", o.argv[0]))?;
+        tree = tree_for(&child, o);
         me.job_pid = Some(child.id());
         me.job_started = procs::created(child.id());
         let _l = lock(root)?;
